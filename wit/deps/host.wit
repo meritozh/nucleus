@@ -1,0 +1,42 @@
+// Cordis host interface, contract v0.1.
+//
+// This directory is the single source of truth for the Wasm plugin
+// boundary. Changing it is an interface change: run the contract
+// regression tests (crates/cordis-wasm) and bump the package versions.
+//
+// Design notes (see docs/design.md §5):
+// - guests hold opaque ids, never host objects;
+// - effect registration returns an id the host calls back on unload;
+// - event subscription is a native WASI 0.3 `stream`;
+// - all cross-boundary calls that may block are `[async]`.
+
+package cordis:host@0.1.0;
+
+interface host {
+    /// A dispatched event. `payload` is a JSON-encoded value whose schema
+    /// is defined by the event name (mirrors cordis typed events).
+    record event {
+        name: string,
+        payload: string,
+    }
+
+    /// Register an external resource whose cleanup the guest owns. The
+    /// returned id is passed back to `dispose-effect` at unload time, in
+    /// reverse registration order (LIFO), matching cordis semantics.
+    register-effect: func(label: string) -> u64;
+
+    /// Subscribe to events matching a pattern ("stats/*", "*", or an
+    /// exact name). The stream stays valid until the guest store is
+    /// dropped at unload.
+    /// Declared `[async]` so the host gets store access (via the
+    /// `HostWithStore` codegen) needed to create the stream.
+    subscribe: async func(pattern: string) -> stream<event>;
+
+    /// Fire-and-forget event dispatch (cordis `emit`). `payload` is JSON.
+    emit: func(name: string, payload: string);
+
+    /// Call a named service exposed on the host context. The service must
+    /// implement the host-side `Invokable` trait (JSON in/out); not every
+    /// service is guest-visible.
+    call-service: async func(service: string, method: string, arg: string) -> result<string, string>;
+}

@@ -1,0 +1,21 @@
+[package]
+name = "cordis-guest-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone by design: building needs the wasm32-unknown-unknown target
+# and wasm-tools; the host workspace must not require either. The `plugin`
+# world imports nothing from WASI, so the plain unknown-unknown target is
+# sufficient (there is no wasm32-wasip3 target on any toolchain — WASI 0.3
+# is a package/API level change, not a target).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+
+[profile.release]
+opt-level = "s"

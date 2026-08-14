@@ -1,0 +1,15 @@
+[package]
+name = "cordis-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Spatiotemporal composability runtime: fibers, revertible effects, services, typed events"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }

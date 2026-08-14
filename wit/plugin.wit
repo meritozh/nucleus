@@ -1,0 +1,20 @@
+// Cordis guest world, contract v0.1.
+//
+// v0.1 scope: init / dispose-effect / register-effect / subscribe / emit /
+// call-service. Deferred to v0.2 (documented in design.md §8):
+// - guest-side waterfall middleware (needs a `handle-waterfall` export);
+//   the current contract has no `waterfall-next` because nothing could
+//   hand a guest a handle yet.
+
+package cordis:plugin@0.1.0;
+
+world plugin {
+    import cordis:host/host@0.1.0;
+
+    /// cordis `apply`: acquire resources, register effects and listeners.
+    /// Config is the JSON value from the mount row.
+    export init: async func(config: string) -> result;
+
+    /// Disposer callback for one effect id (see `register-effect`).
+    export dispose-effect: async func(handle: u64) -> result;
+}
