@@ -1,12 +1,9 @@
-# nucleus — cordis-rs
+# nucleus
 
-[![status](https://img.shields.io/badge/status-P1%2FP2%2FP3%20implemented-green)]()
-[![tests](https://img.shields.io/badge/tests-27%20passed-green)]()
-
-Rust implementation of the **cordis** paradigm — the "spatiotemporal
-composability" plugin framework vendored inside
-[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — with
-runtime dynamic pluggability via WASI 0.3 WebAssembly components.
+Spatiotemporal composability runtime — a Rust implementation of the
+cordis paradigm (from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)),
+rebranded as nucleus and extended with runtime dynamic pluggability via
+WASI 0.3 WebAssembly components.
 
 Two orthogonal dimensions, one runtime:
 
@@ -23,10 +20,10 @@ Two orthogonal dimensions, one runtime:
 ┌─────────────────────────────────────────────────────┐
 │  应用（agent harness 等）                             │
 ├─────────────────────────────────────────────────────┤
-│  cordis-loader   cordis.yml 按 id diff 协调、          │
+│  nucleus-loader   nucleus.yml 按 id diff 协调、          │
 │                  disabled/groups/isolate、HMR watch   │
 ├─────────────────────────────────────────────────────┤
-│  cordis-core     Fiber 状态机、effect 回滚栈、          │
+│  nucleus-core     Fiber 状态机、effect 回滚栈、          │
 │                  (scope,name) 服务注册表、事件分发、     │
 │                  依赖级联重载          （纯安全 Rust）   │
 ├─────────────────────────────────────────────────────┤
@@ -37,21 +34,21 @@ Two orthogonal dimensions, one runtime:
 ```
 
 **Full design note: [docs/design.md](docs/design.md)** — research summary of
-dsh/cordis, concept mapping, key decisions, risks.
+dsh/nucleus, concept mapping, key decisions, risks.
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
-| `cordis-core` | fibers, revertible effects, typed services, 5 event dispatch modes (emit / parallel / serial / waterfall / +dynamic), scopes, cascade reload |
-| `cordis-loader` | row config reconciliation by `id`, `disabled`, nested `group` + `isolate` scopes, HMR file watch |
-| `cordis-wasm` | `PluginSource` over `.wasm` components: guest init/dispose-effect lifecycle, event streams into guests, `call-service` bridge, fuel + memory limits |
-| `wit/` | the host↔guest contract (two packages: `cordis:host` + `cordis:plugin`) |
+| `nucleus-core` | fibers, revertible effects, typed services, 5 event dispatch modes (emit / parallel / serial / waterfall / +dynamic), scopes, cascade reload |
+| `nucleus-loader` | row config reconciliation by `id`, `disabled`, nested `group` + `isolate` scopes, HMR file watch |
+| `nucleus-wasm` | `PluginSource` over `.wasm` components: guest init/dispose-effect lifecycle, event streams into guests, `call-service` bridge, fuel + memory limits |
+| `wit/` | the host↔guest contract (two packages: `nucleus:host` + `nucleus:plugin`) |
 
 ## Quick start
 
 ```rust,ignore
-use cordis_core::{App, Context, Plugin, MountSpec};
+use nucleus_core::{App, Context, Plugin, MountSpec};
 use std::sync::Arc;
 
 struct Greeter;
@@ -60,13 +57,13 @@ struct GreeterSvc(Context);
 #[async_trait::async_trait]
 impl Plugin for Greeter {
     fn name(&self) -> &str { "greeter" }
-    async fn apply(&self, ctx: Context) -> cordis_core::Result<()> {
+    async fn apply(&self, ctx: Context) -> nucleus_core::Result<()> {
         ctx.provide::<dyn GreeterService>("greeter", Arc::new(GreeterSvc(ctx.clone()))).await
     }
 }
 
 let app = App::new().with_static(
-    cordis_core::static_source! { "greeter" => |_cfg| Ok(Arc::new(Greeter)) },
+    nucleus_core::static_source! { "greeter" => |_cfg| Ok(Arc::new(Greeter)) },
 );
 let fiber = app.mount(MountSpec::new("greeter")).await?;
 fiber.dispose().await?;           // unwinds everything, LIFO
@@ -76,7 +73,7 @@ Run the end-to-end demo (pending → activation → cascade reload → provider
 swap → teardown):
 
 ```console
-$ cargo run -p cordis-core --example composition
+$ cargo run -p nucleus-core --example composition
 [app] consumer state: pending
 [consumer] mounted, service says: hello from v1, world
 [app] after provider mounts, consumer state: active
@@ -85,10 +82,10 @@ $ cargo run -p cordis-core --example composition
 ...
 ```
 
-HMR demo (edit the printed `cordis.yml` live):
+HMR demo (edit the printed `nucleus.yml` live):
 
 ```console
-$ cargo run -p cordis-loader --example hmr
+$ cargo run -p nucleus-loader --example hmr
 initial: mounted=1 remounted=0 unmounted=0 unchanged=0 failed=0
 edited:  mounted=1 remounted=1 unmounted=0 unchanged=1 failed=0
 ...
@@ -101,7 +98,7 @@ Guests implement the world in `wit/plugin.wit` (`init` = apply,
 `emit` / `call-service` host imports). Host side:
 
 ```rust,ignore
-let source = cordis_wasm::WasmSource::new("./plugins"); // <name>.wasm
+let source = nucleus_wasm::WasmSource::new("./plugins"); // <name>.wasm
 let app = App::new()
     .with_source("wasm", std::sync::Arc::new(source));
 let fiber = app.mount(MountSpec::new("hello").with_source("wasm")).await?;
@@ -117,8 +114,8 @@ plain `wasm32-unknown-unknown` target on **stable** Rust suffices):
 rustup target add wasm32-unknown-unknown
 (cd examples/wasm-guest && cargo build --release --target wasm32-unknown-unknown)
 wasm-tools component new \
-  examples/wasm-guest/target/wasm32-unknown-unknown/release/cordis_guest_example.wasm \
-  -o crates/cordis-wasm/tests/fixtures/hello.wasm
+  examples/wasm-guest/target/wasm32-unknown-unknown/release/nucleus_guest_example.wasm \
+  -o crates/nucleus-wasm/tests/fixtures/hello.wasm
 ```
 
 Verified versions: wit-bindgen 0.51 (needs `generate_all` in

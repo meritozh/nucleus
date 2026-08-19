@@ -1,0 +1,20 @@
+[package]
+name = "nucleus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Spatiotemporal composability runtime: fibers, revertible effects, services, typed events"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }

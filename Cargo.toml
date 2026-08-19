@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cordis-core",
-    "crates/cordis-loader",
-    "crates/cordis-wasm",
+    "crates/nucleus-core",
+    "crates/nucleus-loader",
+    "crates/nucleus-wasm",
+    "crates/nucleus-guest",
 ]
 
 [workspace.package]
@@ -12,9 +13,10 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-cordis-core = { path = "crates/cordis-core" }
-cordis-loader = { path = "crates/cordis-loader" }
-cordis-wasm = { path = "crates/cordis-wasm" }
+nucleus-core = { path = "crates/nucleus-core" }
+nucleus-loader = { path = "crates/nucleus-loader" }
+nucleus-wasm = { path = "crates/nucleus-wasm" }
+nucleus-guest = { path = "crates/nucleus-guest" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }

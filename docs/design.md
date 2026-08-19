@@ -1,37 +1,37 @@
-# Cordis-RS 设计 Note（nucleus）
+# Nucleus-RS 设计 Note（nucleus）
 
 > 状态：P1/P2/P3 已实现并通过 /check 深度审查；Wasm 边界有真实 guest 组件的集成测试（见 §5.2 guest 工具链事实）。
-> 来源：对 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 与 [cordiverse/cordis](https://github.com/cordiverse/cordis) 的研究（2026-08），以及据此制定的 Rust 移植方案 v2。
+> 来源：对 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 与 [cordiverse/nucleus](https://github.com/cordiverse/nucleus) 的研究（2026-08），以及据此制定的 Rust 移植方案 v2。
 > 本文档是项目的唯一设计事实来源：实现与本文冲突时，要么改实现，要么改本文并说明原因。
 
 ---
 
-## 1. 研究结论：cordis 是什么
+## 1. 研究结论：nucleus 是什么
 
-dsh（DeepSeek Harness）是 TypeScript 编写的 agent harness，架构口号是 "everything is a plugin"——模型适配器、工具注册表、会话日志、agent loop 本身都是可替换插件，没有特权核心。其插件框架 cordis 以源码形式 vendor 进 dsh（`vendor/cordis/`，上游 cordiverse/cordis 4.0.0-rc.7，DeepSeek 叠加 18 处本地修改：fiber 生命周期加固、事务性 Loader 协调、HMR 精确 watch 等）。dsh 的 Rust 代码只有 `native/landlock-run` 沙箱启动器，框架层完全没有 Rust 实现——本项目的空白地带。
+dsh（DeepSeek Harness）是 TypeScript 编写的 agent harness，架构口号是 "everything is a plugin"——模型适配器、工具注册表、会话日志、agent loop 本身都是可替换插件，没有特权核心。其插件框架 nucleus 以源码形式 vendor 进 dsh（`vendor/nucleus/`，上游 cordiverse/nucleus 4.0.0-rc.7，DeepSeek 叠加 18 处本地修改：fiber 生命周期加固、事务性 Loader 协调、HMR 精确 watch 等）。dsh 的 Rust 代码只有 `native/landlock-run` 沙箱启动器，框架层完全没有 Rust 实现——本项目的空白地带。
 
-cordis 论文《A Programming Paradigm for Spatiotemporal Composability》把插件系统形式化为两个正交维度：
+nucleus 论文《A Programming Paradigm for Spatiotemporal Composability》把插件系统形式化为两个正交维度：
 
 - **时间可组合性（temporal）**：组件移除时其副作用可被完全回滚（revertible effects）。
 - **空间可组合性（spatial）**：组件间依赖被声明并响应式管理（reactive coeffects）。
 
 ### 1.1 核心机制盘点（Rust 版需要复刻的本体）
 
-| 机制 | cordis (TS) 语义 |
+| 机制 | nucleus (TS) 语义 |
 |---|---|
 | Fiber | 插件实例的运行时句柄；状态机 `PENDING → LOADING → ACTIVE → UNLOADING → DISPOSED`，可进入 `FAILED`；`dispose()` 递归卸载子插件并 await 所有异步清理 |
 | 可逆 effects | 一切注册（事件监听、服务、子插件、外部资源）都是 effect，卸载时逆序回滚；外部资源用 `ctx.effect(() => { acquire; return disposer })` 包装 |
 | inject / coeffects | 插件声明 `inject: ['tools']`，loader 持有它在 PENDING 直到服务存在；服务消失 → 依赖者被卸载并在服务回归时自动重载；加载顺序完全由依赖决定 |
 | 服务 | 具名能力挂在 `ctx.<key>`；消费方按名查找，配置层可换 provider，依赖者对 新实现"干净地重启" |
 | 事件 | 5 种分发模式：`emit`（同步广播）、`parallel`、`serial`（首个真值短路）、`bail`（同步 serial）、`waterfall`（around 中间件：`(args, next)`，可包装/否决；观察型必须调 `next()`） |
-| Loader | `cordis.yml` 行式配置按 `id` diff：只 mount/unmount/reconfigure 变化的行；`disabled` 保留条目跳过挂载；groups + `isolate` 服务隔离 |
+| Loader | `nucleus.yml` 行式配置按 `id` diff：只 mount/unmount/reconfigure 变化的行；`disabled` 保留条目跳过挂载；groups + `isolate` 服务隔离 |
 | HMR | 卸载回滚一切 + 加载跟随依赖 → 热替换 = unload + reload，文件 watch 触发 |
 
-### 1.2 dsh 如何消费 cordis（对我们设计的校准）
+### 1.2 dsh 如何消费 nucleus（对我们设计的校准）
 
 - 子系统 = 服务：`ctx.sessions`、`ctx.tools`、`ctx.agents`、`ctx.llm`……
 - 扩展点 = 事件：turn/step 为持久 session 事件，`agent/request`、`llm/stream`、`tools/*` 为 waterfall。
-- 配置分层：bundle → profile patch → home patch → CLI overlay，全部落到 cordis.yml 行的协调。
+- 配置分层：bundle → profile patch → home patch → CLI overlay，全部落到 nucleus.yml 行的协调。
 
 ---
 
@@ -39,7 +39,7 @@ cordis 论文《A Programming Paradigm for Spatiotemporal Composability》把插
 
 Rust 里这是两个正交问题，架构必须分层：
 
-1. **组合动态性**（cordis 真正的创新）：运行时挂载/卸载/重载插件实例、配置协调、依赖驱动激活、副作用可逆回滚。**纯安全 Rust 进程内完整实现**，不碰 ABI。
+1. **组合动态性**（nucleus 真正的创新）：运行时挂载/卸载/重载插件实例、配置协调、依赖驱动激活、副作用可逆回滚。**纯安全 Rust 进程内完整实现**，不碰 ABI。
 2. **代码动态性**：不停进程加载新机器码。Rust 无稳定 ABI，必须选宿主/插件边界：Wasm 组件模型 / C-ABI dylib / 子进程 RPC。
 
 JS 版靠动态语言把两者混在一起免费拿到；Rust 版用 `PluginSource` trait 解耦：core 不关心插件代码从哪来。
@@ -58,10 +58,10 @@ JS 版靠动态语言把两者混在一起免费拿到；Rust 版用 `PluginSour
 ┌─────────────────────────────────────────────────────┐
 │  应用（agent harness 等）                             │
 ├─────────────────────────────────────────────────────┤
-│  cordis-loader   yml 行式配置、按 id diff 协调、       │
+│  nucleus-loader   yml 行式配置、按 id diff 协调、       │
 │                  disabled/groups/isolate、HMR watch   │
 ├─────────────────────────────────────────────────────┤
-│  cordis-core     Fiber 状态机、effect 回滚栈、          │
+│  nucleus-core     Fiber 状态机、effect 回滚栈、          │
 │                  (scope,name) 服务注册表、事件分发、     │
 │                  依赖级联重载          （纯安全 Rust）   │
 ├─────────────────────────────────────────────────────┤
@@ -73,25 +73,25 @@ JS 版靠动态语言把两者混在一起免费拿到；Rust 版用 `PluginSour
 
 ### 4.1 概念映射表
 
-| cordis (TS) | cordis-rs | 设计要点 |
+| nucleus (TS) | nucleus-rs | 设计要点 |
 |---|---|---|
 | `ctx.greeter` 动态属性 | `ctx.service::<dyn Greeter>("greeter") -> Result<Arc<dyn Greeter>>` | `(ScopeId, name)` 双键 + `TypeId` 校验；`Box<dyn Any>` 内存 `Arc<T>`（T 可为 `dyn Trait`），downcast_ref 取回 |
 | `ctx.effect(() => disposer)` | `ctx.effect(async { acquire; disposer_closure }).await` | 每 fiber 一个 LIFO 回滚栈；disposer 返回 `BoxFuture<'static, ()>`；卸载逆序发起并 await |
 | Fiber 状态机 | `enum FiberState` 完整复刻 | `FAILED` 时也回滚已登记的部分 effects（dsh 加固点）；卸载整体带超时（默认 5s，`App::unload_timeout` 可调），超时后标记 Disposed 并记录错误（尽力而为语义，文档明示） |
 | 依赖级联 | registry 记录 `服务 → provider fiber`，inject 扫描反查依赖者 | 服务注销 → 依赖者逆序卸载并**重置回 PENDING**（保留 entry）→ 服务回归 → `wake_pending` 自动重挂载 |
 | `waterfall` | `TypedNext<A, O>` 中间件链 | listener `(ctx, args, next)`；`next.run()` 深入链条；不调 next = veto；`on_waterfall_prepend` 提供 `prepend: true` |
-| `cordis.yml` | `cordis-loader` 同款字段 `id/name/source/config/disabled/group` | 按 id diff 出 Mount/Unmount/Reconfigure/Noop；无 id 行每次生成新 id（故意保留 cordis 行为：任何编辑都 remount，文档警告"总是写 id"） |
+| `nucleus.yml` | `nucleus-loader` 同款字段 `id/name/source/config/disabled/group` | 按 id diff 出 Mount/Unmount/Reconfigure/Noop；无 id 行每次生成新 id（故意保留 nucleus 行为：任何编辑都 remount，文档警告"总是写 id"） |
 | isolate groups | `ScopeId` 作用于服务键 | 查找顺序：本 scope → 全局；provide 落在本 fiber scope |
 | bail | 未实现 | 一切皆 async 的运行时里 bail≈serial；serial 返回首个非 null 真值（文档说明） |
 
 ### 4.2 模块归属
 
 ```
-crates/cordis-core     error / fiber / events / context / plugin / app + tests/
-crates/cordis-loader   RowSpec 解析、diff、协调执行、notify HMR + tests/
-crates/cordis-wasm     bindgen 宿主、WasmSource、ChannelProducer、fuel/内存限制
-wit/deps/host.wit      宿主接口包 cordis:host@0.1.0（唯一权威，升级=接口变更）
-wit/plugin.wit         guest world 包 cordis:plugin@0.1.0
+crates/nucleus-core     error / fiber / events / context / plugin / app + tests/
+crates/nucleus-loader   RowSpec 解析、diff、协调执行、notify HMR + tests/
+crates/nucleus-wasm     bindgen 宿主、WasmSource、ChannelProducer、fuel/内存限制
+wit/deps/host.wit      宿主接口包 nucleus:host@0.1.0（唯一权威，升级=接口变更）
+wit/plugin.wit         guest world 包 nucleus:plugin@0.1.0
 examples/wasm-guest/   guest 源码参考（不进 workspace，需 wasm32 p3 target）
 ```
 
@@ -102,7 +102,7 @@ examples/wasm-guest/   guest 源码参考（不进 workspace，需 wasm32 p3 tar
 ## 5. WIT 契约 v0.1（最终形态，已随实现定稿）
 
 ```wit
-// wit/deps/host.wit — package cordis:host@0.1.0
+// wit/deps/host.wit — package nucleus:host@0.1.0
 interface host {
   record event { name: string, payload: string }
   register-effect: func(label: string) -> u64;               // 效果登记，返回 id
@@ -111,10 +111,10 @@ interface host {
   call-service: async func(service: string, method: string, arg: string)
     -> result<string, string>;                                // Invokable 服务代理
 }
-// wit/plugin.wit — package cordis:plugin@0.1.0
+// wit/plugin.wit — package nucleus:plugin@0.1.0
 world plugin {
-  import cordis:host/host@0.1.0;
-  export init: async func(config: string) -> result;          // 即 cordis apply
+  import nucleus:host/host@0.1.0;
+  export init: async func(config: string) -> result;          // 即 nucleus apply
   export dispose-effect: async func(handle: u64) -> result;   // LIFO 反注册回调
 }
 ```
@@ -174,13 +174,13 @@ resource 方法负担，v0.2 升级路径清晰）；`waterfall-next`/waterfall-
 
 | 阶段 | 交付 | 验收（测试名，全部通过） |
 |---|---|---|
-| P1 ✅ | cordis-core + WIT v0.1 | `unload_rewinds_everything_in_reverse_order`（LIFO 基线）；`failed_apply_unwinds_partial_effects`；`inject_pending_then_activation_and_cascade_reload`（空间基线）；`disposing_a_never_activated_fiber_removes_it`；`waterfall_transform_and_veto` / `waterfall_prepend_runs_before_ordinary`；`serial_first_truthy_short_circuits`；`scoped_services_shadow_and_fall_back`；`type_mismatch_is_reported` |
-| P2 ✅ | cordis-wasm（wasmtime 47） | `real_guest_full_lifecycle` / `remount_gets_a_fresh_guest_instance` / `missing_wasm_file_is_a_mount_failure_not_a_hang`（真实 guest 组件）+ 4 项宿主单测（pattern 匹配、registry 扇出、内存限制、路径解析）；构建链 `scripts/build-guest.sh` |
-| P3 ✅ | cordis-loader | `diff_by_id_only_touches_changed_rows`；`unchanged_rows_do_not_remount`；`disabled_keeps_entry_and_skips_mount`；`isolate_groups_get_private_service_instances`；`hmr_reload_on_file_change`（真实文件 watch） |
+| P1 ✅ | nucleus-core + WIT v0.1 | `unload_rewinds_everything_in_reverse_order`（LIFO 基线）；`failed_apply_unwinds_partial_effects`；`inject_pending_then_activation_and_cascade_reload`（空间基线）；`disposing_a_never_activated_fiber_removes_it`；`waterfall_transform_and_veto` / `waterfall_prepend_runs_before_ordinary`；`serial_first_truthy_short_circuits`；`scoped_services_shadow_and_fall_back`；`type_mismatch_is_reported` |
+| P2 ✅ | nucleus-wasm（wasmtime 47） | `real_guest_full_lifecycle` / `remount_gets_a_fresh_guest_instance` / `missing_wasm_file_is_a_mount_failure_not_a_hang`（真实 guest 组件）+ 4 项宿主单测（pattern 匹配、registry 扇出、内存限制、路径解析）；构建链 `scripts/build-guest.sh` |
+| P3 ✅ | nucleus-loader | `diff_by_id_only_touches_changed_rows`；`unchanged_rows_do_not_remount`；`disabled_keeps_entry_and_skips_mount`；`isolate_groups_get_private_service_instances`；`hmr_reload_on_file_change`（真实文件 watch） |
 
 实现期间发现并修复：dispose 一个从未激活的 PENDING fiber 曾是 no-op
 （条目泄漏）——已修复并有回归测试；子插件卸载最初是"先全部子级再父级"的
-拓扑序，改为把子卸载作为 disposer 压入父的 LIFO 栈（更忠实 cordis：挂载
+拓扑序，改为把子卸载作为 disposer 压入父的 LIFO 栈（更忠实 nucleus：挂载
 于两个父 effect 之间的子插件，回滚时也回退在这两者之间）。
 
 **/check 深度审查（双专家并行）后的加固**，全部带回归测试或语义对齐：
@@ -211,7 +211,7 @@ resource 方法负担，v0.2 升级路径清晰）；`waterfall-next`/waterfall-
   repend，旧 apply 未被取消/等待，与新 apply 可能并发。防线：非存活 fiber
   的注册一律拒绝（FiberNotLive），后续注册被丢弃并告警。完整的 per-fiber
   apply 串行化（取消或互斥）留给 v0.2。
-- 快照后分发可能把一个在途事件投递给刚被移除的监听器（cordis TS 同款语
+- 快照后分发可能把一个在途事件投递给刚被移除的监听器（nucleus TS 同款语
   义，benign）；监听器的 scope 已随快照同锁捕获，不再有 GLOBAL 回退错配。
 - 订阅模式过滤当前是广播（tap 侧 pattern 传下去了，`dispatch` 匹配在
   v0.1 已实现 exact / `prefix*` / `*`——但慢 guest 丢事件策略意味着
@@ -228,8 +228,8 @@ resource 方法负担，v0.2 升级路径清晰）；`waterfall-next`/waterfall-
 
 ## 9. 参考资料
 
-- dsh 仓库与文档：README / docs/architecture.md / docs/cordis-primer.md / docs/cordis-tutorial（01-07 章）/ vendor/README.md
-- cordis：cordiverse/cordis；论文 cordiverse/paper《A Programming Paradigm for Spatiotemporal Composability》
+- dsh 仓库与文档：README / docs/architecture.md / docs/nucleus-primer.md / docs/nucleus-tutorial（01-07 章）/ vendor/README.md
+- nucleus：cordiverse/nucleus；论文 cordiverse/paper《A Programming Paradigm for Spatiotemporal Composability》
 - WASI 0.3：bytecodealliance.org/articles/WASI-0.3；wasi.dev/releases/wasi-p3；wasi.dev roadmap（wasmtime 43+）
 - 取消 CVE：GHSA-xjhv-v822-pf94（≥42 修复）；Debian tracker CVE-2026-27195
 - wasmtime 组件异步：docs.wasmtime.dev/api/wasmtime/component；wasmCloud "WASI P3"（Guest trait async 形态）

@@ -1,0 +1,18 @@
+[package]
+name = "nucleus-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wasm PluginSource for nucleus-core (wasmtime, WASI 0.3 native async)"
+
+[dependencies]
+nucleus-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+anyhow = "1"
+wasmtime = { workspace = true, features = ["component-model", "async", "cranelift"] }

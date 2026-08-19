@@ -1,4 +1,4 @@
-// Cordis guest world, contract v0.1.
+// Nucleus guest world, contract v0.1.
 //
 // v0.1 scope: init / dispose-effect / register-effect / subscribe / emit /
 // call-service. Deferred to v0.2 (documented in design.md §8):
@@ -6,15 +6,21 @@
 //   the current contract has no `waterfall-next` because nothing could
 //   hand a guest a handle yet.
 
-package cordis:plugin@0.1.0;
+package nucleus:plugin@0.1.0;
 
 world plugin {
-    import cordis:host/host@0.1.0;
+    import nucleus:host/host@0.1.0;
 
-    /// cordis `apply`: acquire resources, register effects and listeners.
+    /// nucleus `apply`: acquire resources, register effects and listeners.
     /// Config is the JSON value from the mount row.
     export init: async func(config: string) -> result;
 
     /// Disposer callback for one effect id (see `register-effect`).
     export dispose-effect: async func(handle: u64) -> result;
+
+    /// Host→guest service call: invoked when a host-side caller invokes a
+    /// service the guest provided via `provide-service`. `service` is the
+    /// name the guest registered; `arg` is JSON; the guest returns JSON or
+    /// an error string.
+    export handle-service: async func(service: string, method: string, arg: string) -> result<string, string>;
 }
