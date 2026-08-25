@@ -65,10 +65,9 @@ pub async fn run_hmr(app: nucleus_core::App, path: impl Into<PathBuf>) -> crate:
         tokio::time::sleep(DEBOUNCE).await;
         {
             let rx = rx.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                while rx.lock().unwrap().try_recv().is_ok() {}
-            })
-            .await;
+            let _ =
+                tokio::task::spawn_blocking(move || while rx.lock().unwrap().try_recv().is_ok() {})
+                    .await;
         }
         match loader.load_file(&path).await {
             Ok(report) => {

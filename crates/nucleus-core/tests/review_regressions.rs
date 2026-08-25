@@ -138,7 +138,10 @@ async fn failed_apply_removes_services_and_restarts_dependents() {
     let consumer = app.mount(MountSpec::new("consumer")).await.unwrap();
     assert_eq!(consumer.state(), FiberState::Pending);
 
-    let provider = app.mount(MountSpec::new("provider-that-fails")).await.unwrap();
+    let provider = app
+        .mount(MountSpec::new("provider-that-fails"))
+        .await
+        .unwrap();
     assert_eq!(provider.state(), FiberState::Failed);
     assert!(
         app.services().is_empty(),

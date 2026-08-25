@@ -46,14 +46,16 @@ pub mod error;
 pub mod events;
 pub mod fiber;
 pub mod plugin;
+pub mod service;
 pub mod state;
 
 pub use app::{App, ServiceInfo};
 pub use context::Context;
-pub use error::{Error, Result};
+pub use error::{DisposeFailure, Error, Result};
 pub use events::{DispatchMode, Event, Next, TypedNext, WaterfallEvent};
 pub use fiber::{FiberHandle, FiberId, FiberInfo, FiberState, ScopeId, GLOBAL};
 pub use plugin::{Invokable, MountSpec, Plugin, PluginSource, StaticSource};
+pub use service::ServiceKey;
 pub use state::{CloneAny, Disposer, Host, TapBox};
 
 // Re-export tracing so that macros (e.g. nucleus_guest::export_plugin!) can
@@ -63,8 +65,9 @@ pub use tracing;
 pub mod prelude {
     pub use crate::app::App;
     pub use crate::context::Context;
-    pub use crate::error::{Error, Result};
+    pub use crate::error::{DisposeFailure, Error, Result};
     pub use crate::events::{Event, WaterfallEvent};
     pub use crate::fiber::{FiberHandle, FiberState};
     pub use crate::plugin::{MountSpec, Plugin, PluginSource, StaticSource};
+    pub use crate::service::ServiceKey;
 }

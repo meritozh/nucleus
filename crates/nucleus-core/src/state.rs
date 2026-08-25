@@ -1,6 +1,6 @@
 //! Internal shared state: fibers, services, event routes, sources.
 
-use crate::error::{Error, Result};
+use crate::error::{DisposeFailure, Error, Result};
 use crate::events::{PlainBox, WaterfallBox};
 use crate::fiber::{FiberId, FiberState, ScopeId, GLOBAL};
 use crate::plugin::Plugin;
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-pub type Disposer = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+pub type Disposer = Box<dyn FnOnce() -> BoxFuture<'static, Result<(), String>> + Send>;
 
 /// Object-safe trait for cloneable boxed values. Service entries store
 /// `Arc<T>` boxed as `dyn CloneAny` so `get_service` can return a clone
@@ -50,21 +50,14 @@ pub(crate) struct ServiceEntry {
 pub(crate) struct ListenerEntry<H> {
     pub id: u64,
     pub owner: FiberId,
+    pub activation: u64,
     pub handler: H,
 }
 
+#[derive(Default)]
 pub(crate) struct Route {
     pub plain: Vec<ListenerEntry<PlainBox>>,
     pub waterfall: Vec<ListenerEntry<WaterfallBox>>,
-}
-
-impl Default for Route {
-    fn default() -> Self {
-        Self {
-            plain: Vec::new(),
-            waterfall: Vec::new(),
-        }
-    }
 }
 
 impl Route {
@@ -81,6 +74,7 @@ pub(crate) struct FiberData {
     pub config: Value,
     pub plugin: Arc<dyn Plugin>,
     pub state: FiberState,
+    pub activation: u64,
     pub parent: Option<FiberId>,
     pub children: Vec<FiberId>,
     pub inject: Vec<String>,
@@ -110,13 +104,36 @@ pub(crate) struct AppState {
 
 impl AppState {
     pub fn service_exists(&self, scope: ScopeId, name: &str) -> bool {
-        self.services.contains_key(&(scope, name.to_string()))
-            || (scope != GLOBAL && self.services.contains_key(&(GLOBAL, name.to_string())))
+        self.service_entry(scope, name).is_some()
     }
 
     pub fn alloc_scope(&mut self) -> ScopeId {
         self.next_scope += 1;
         self.next_scope
+    }
+
+    fn service_entry(&self, scope: ScopeId, name: &str) -> Option<&ServiceEntry> {
+        let entry = self.services.get(&(scope, name.to_string())).or_else(|| {
+            (scope != GLOBAL)
+                .then(|| self.services.get(&(GLOBAL, name.to_string())))
+                .flatten()
+        })?;
+        matches!(
+            self.fibers.get(&entry.provider).map(|fiber| fiber.state),
+            Some(FiberState::Loading) | Some(FiberState::Active)
+        )
+        .then_some(entry)
+    }
+
+    fn service_provider(&self, scope: ScopeId, name: &str) -> Option<FiberId> {
+        self.services
+            .get(&(scope, name.to_string()))
+            .or_else(|| {
+                (scope != GLOBAL)
+                    .then(|| self.services.get(&(GLOBAL, name.to_string())))
+                    .flatten()
+            })
+            .map(|entry| entry.provider)
     }
 }
 
@@ -144,14 +161,21 @@ pub trait Host: Any + Send + Sync {
     // ---- effects --------------------------------------------------------
 
     /// Push a disposer onto the owning fiber's LIFO stack.
-    fn push_disposer(&self, fiber: FiberId, disposer: Disposer);
+    fn push_disposer(
+        &self,
+        fiber: FiberId,
+        activation: u64,
+        disposer: Disposer,
+    ) -> Option<Disposer>;
 
     // ---- services -------------------------------------------------------
 
     /// Register a service under `(scope, name)`. `value` is a boxed `Arc<T>`.
+    #[allow(clippy::too_many_arguments)]
     async fn provide_service(
         &self,
         fiber: FiberId,
+        activation: u64,
         scope: ScopeId,
         name: &str,
         value: Box<dyn CloneAny>,
@@ -160,12 +184,8 @@ pub trait Host: Any + Send + Sync {
     ) -> Result<()>;
 
     /// Look up a service by `(scope, name)` and `type_id`.
-    fn get_service(
-        &self,
-        scope: ScopeId,
-        name: &str,
-        type_id: TypeId,
-    ) -> Result<Box<dyn CloneAny>>;
+    fn get_service(&self, scope: ScopeId, name: &str, type_id: TypeId)
+        -> Result<Box<dyn CloneAny>>;
 
     /// Whether a service exists at `(scope, name)` (falling back to GLOBAL).
     fn service_exists(&self, scope: ScopeId, name: &str) -> bool;
@@ -177,6 +197,7 @@ pub trait Host: Any + Send + Sync {
     fn add_plain_listener(
         &self,
         fiber: FiberId,
+        activation: u64,
         name: &str,
         handler: PlainBox,
     ) -> Result<u64>;
@@ -185,6 +206,7 @@ pub trait Host: Any + Send + Sync {
     fn add_waterfall_listener(
         &self,
         fiber: FiberId,
+        activation: u64,
         name: &str,
         handler: WaterfallBox,
         prepend: bool,
@@ -194,7 +216,7 @@ pub trait Host: Any + Send + Sync {
     fn remove_waterfall_listener(&self, name: &str, id: u64);
 
     /// Snapshot of plain listeners for an event (owner, scope, handler).
-    fn snapshot_plain(&self, name: &str) -> Vec<(FiberId, ScopeId, PlainBox)>;
+    fn snapshot_plain(&self, name: &str) -> Vec<(FiberId, u64, ScopeId, PlainBox)>;
 
     /// Snapshot of waterfall listeners for an event.
     fn snapshot_waterfall(&self, name: &str) -> Vec<WaterfallBox>;
@@ -210,7 +232,7 @@ pub trait Host: Any + Send + Sync {
 
     // ---- taps -----------------------------------------------------------
 
-    fn add_tap(&self, fiber: FiberId, handler: TapBox) -> Result<u64>;
+    fn add_tap(&self, fiber: FiberId, activation: u64, handler: TapBox) -> Result<u64>;
     fn remove_tap(&self, id: u64);
 
     // ---- child plugins --------------------------------------------------
@@ -219,6 +241,7 @@ pub trait Host: Any + Send + Sync {
     async fn mount_child(
         &self,
         parent: FiberId,
+        activation: u64,
         spec: crate::plugin::MountSpec,
     ) -> Result<FiberId>;
 
@@ -242,9 +265,7 @@ pub trait Host: Any + Send + Sync {
 
 impl AppInner {
     pub fn lock_state(&self) -> MutexGuard<'_, AppState> {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Missing inject names for one fiber (diagnostics + mount gating).
@@ -287,35 +308,48 @@ impl AppInner {
         })
     }
 
-    /// Remove every service this fiber provides and return the Active
-    /// dependents that must be repended. Single critical section with
-    /// `mem::take` so a racing `provide` cannot hide a new entry from the
-    /// drain (provide rejects non-live fibers, closing the other half).
-    pub(crate) fn remove_fiber_services(&self, id: FiberId) -> Vec<FiberId> {
-        let mut st = self.lock_state();
-        let Some(f) = st.fibers.get_mut(&id) else {
+    fn service_dependents_locked(st: &AppState, id: FiberId) -> Vec<FiberId> {
+        let Some(provider) = st.fibers.get(&id) else {
             return Vec::new();
         };
-        let scope = f.scope;
-        let provides = std::mem::take(&mut f.provides);
-        let mut affected: Vec<FiberId> = Vec::new();
-        for name in &provides {
-            if st.services.remove(&(scope, name.clone())).is_some() {
-                affected.extend(
-                    st.fibers
-                        .values()
-                        .filter(|d| {
-                            d.state == FiberState::Active
-                                && (d.scope == scope || scope == GLOBAL)
-                                && d.inject.iter().any(|i| i == name)
-                        })
-                        .map(|d| d.id),
-                );
-            }
-        }
+        let mut affected = st
+            .fibers
+            .values()
+            .filter(|fiber| {
+                fiber.id != id
+                    && matches!(fiber.state, FiberState::Active | FiberState::Loading)
+                    && fiber.inject.iter().any(|name| {
+                        provider.provides.iter().any(|provided| provided == name)
+                            && st.service_provider(fiber.scope, name) == Some(id)
+                    })
+            })
+            .map(|fiber| fiber.id)
+            .collect::<Vec<_>>();
         affected.sort_unstable();
         affected.dedup();
         affected
+    }
+
+    /// Remove every service this fiber provides. Single critical section with
+    /// `mem::take` so a racing `provide` cannot hide a new entry from the
+    /// drain (provide rejects non-live fibers, closing the other half).
+    pub(crate) fn remove_fiber_services(&self, id: FiberId) {
+        let mut st = self.lock_state();
+        let Some(f) = st.fibers.get_mut(&id) else {
+            return;
+        };
+        let scope = f.scope;
+        let provides = std::mem::take(&mut f.provides);
+        for name in &provides {
+            let key = (scope, name.clone());
+            if st
+                .services
+                .get(&key)
+                .is_some_and(|entry| entry.provider == id)
+            {
+                st.services.remove(&key);
+            }
+        }
     }
 
     /// Central, idempotent removal of event routes and taps owned by a
@@ -348,6 +382,7 @@ impl AppInner {
     pub(crate) async fn mount_fiber(
         &self,
         parent: Option<FiberId>,
+        parent_activation: Option<u64>,
         spec: crate::plugin::MountSpec,
     ) -> Result<FiberId, Error> {
         let source = {
@@ -373,8 +408,9 @@ impl AppInner {
             // A child mounted by a fiber that died mid-apply would be
             // orphaned (not a root, parent gone): refuse instead.
             if let Some(p) = parent {
-                match st.fibers.get(&p).map(|f| f.state) {
-                    Some(FiberState::Loading) | Some(FiberState::Active) => {}
+                match st.fibers.get(&p).map(|f| (f.state, f.activation)) {
+                    Some((FiberState::Loading | FiberState::Active, activation))
+                        if Some(activation) == parent_activation => {}
                     _ => {
                         return Err(Error::ApplyFailed(
                             spec.name.clone(),
@@ -401,6 +437,7 @@ impl AppInner {
                     config: spec.config.clone(),
                     plugin: plugin.clone(),
                     state: FiberState::Pending,
+                    activation: 0,
                     parent,
                     children: Vec::new(),
                     inject,
@@ -421,7 +458,7 @@ impl AppInner {
                         pf.disposers.push(Box::new(move || {
                             let app = app.clone();
                             Box::pin(async move {
-                                let _ = app.unload_fiber(id, false).await;
+                                app.unload_fiber(id, false).await.map_err(|e| e.to_string())
                             })
                         }));
                     }
@@ -438,7 +475,7 @@ impl AppInner {
     /// `Pending → Loading → apply`. Stays `Pending` when injects are not
     /// satisfiable yet. `Failed` still unwinds partial effects.
     pub(crate) async fn try_progress(&self, id: FiberId) {
-        let (plugin, ctx) = {
+        let (plugin, ctx, activation) = {
             let mut st = self.lock_state();
             let Some(f) = st.fibers.get(&id) else {
                 return;
@@ -447,24 +484,25 @@ impl AppInner {
                 return;
             }
             let scope = f.scope;
-            let unsatisfied = f
-                .inject
-                .iter()
-                .any(|n| !st.service_exists(scope, n));
+            let unsatisfied = f.inject.iter().any(|n| !st.service_exists(scope, n));
             if unsatisfied {
                 return; // stay Pending: a provider may mount later
             }
             let plugin = f.plugin.clone();
             if let Some(f) = st.fibers.get_mut(&id) {
+                f.activation = f.activation.wrapping_add(1);
                 f.state = FiberState::Loading;
             }
+            let activation = st.fibers.get(&id).expect("fiber exists").activation;
             (
                 plugin,
                 crate::context::Context {
                     host: self.self_weak.upgrade().expect("app alive") as Arc<dyn Host>,
                     fiber: id,
                     scope,
+                    activation,
                 },
+                activation,
             )
         };
 
@@ -473,10 +511,8 @@ impl AppInner {
         // path (unwind + Failed).
         let outcome = {
             let name = plugin.name().to_string();
-            match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                plugin.apply(ctx),
-            ))
-            .await
+            match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(plugin.apply(ctx)))
+                .await
             {
                 Ok(r) => r,
                 Err(panic) => {
@@ -490,6 +526,17 @@ impl AppInner {
             }
         };
 
+        let is_current = {
+            let st = self.lock_state();
+            matches!(
+                st.fibers.get(&id),
+                Some(f) if f.state == FiberState::Loading && f.activation == activation
+            )
+        };
+        if !is_current {
+            return;
+        }
+
         match outcome {
             Ok(()) => {
                 // Re-check injects under the lock: a provider may have been
@@ -499,55 +546,77 @@ impl AppInner {
                 let unsatisfied = {
                     let st = self.lock_state();
                     match st.fibers.get(&id) {
-                        Some(f) if f.state == FiberState::Loading => f
-                            .inject
-                            .iter()
-                            .any(|n| !st.service_exists(f.scope, n)),
+                        Some(f) if f.state == FiberState::Loading && f.activation == activation => {
+                            f.inject.iter().any(|n| !st.service_exists(f.scope, n))
+                        }
                         _ => false,
                     }
                 };
                 if unsatisfied {
-                    if let Some(f) = self.lock_state().fibers.get_mut(&id) {
-                        if f.state == FiberState::Loading {
-                            f.state = FiberState::Unloading;
+                    let affected = {
+                        let mut st = self.lock_state();
+                        if let Some(f) = st.fibers.get_mut(&id) {
+                            if f.state == FiberState::Loading && f.activation == activation {
+                                f.state = FiberState::Unloading;
+                            }
                         }
-                    }
-                    self.dispose_phase(id).await;
-                    let affected = self.remove_fiber_services(id);
-                    self.purge_fiber_registrations(id);
-                    if let Some(f) = self.lock_state().fibers.get_mut(&id) {
-                        if f.state == FiberState::Unloading {
-                            f.state = FiberState::Pending;
-                        }
-                    }
+                        Self::service_dependents_locked(&st, id)
+                    };
                     for dep in affected {
                         let _ = Box::pin(self.unload_fiber(dep, true)).await;
                     }
+                    let failures = self.dispose_phase(id).await;
+                    self.remove_fiber_services(id);
+                    self.purge_fiber_registrations(id);
+                    if let Some(f) = self.lock_state().fibers.get_mut(&id) {
+                        if f.state == FiberState::Unloading && f.activation == activation {
+                            if failures.is_empty() {
+                                f.state = FiberState::Pending;
+                            } else {
+                                f.state = FiberState::Failed;
+                                f.error = Some(format!("{failures:?}"));
+                            }
+                        }
+                    }
                 } else if let Some(f) = self.lock_state().fibers.get_mut(&id) {
-                    if f.state == FiberState::Loading {
+                    if f.state == FiberState::Loading && f.activation == activation {
                         f.state = FiberState::Active;
                     }
                 }
             }
             Err(err) => {
                 tracing::error!(fiber = id, plugin = %plugin.name(), error = %err, "apply failed");
-                // Unwind effects registered before the error, remove any
-                // services that were provided (they are effects too), and
-                // cascade to dependents that mounted against them.
-                self.dispose_phase(id).await;
-                let affected = self.remove_fiber_services(id);
+                let affected = {
+                    let mut st = self.lock_state();
+                    if let Some(f) = st.fibers.get_mut(&id) {
+                        if f.state == FiberState::Loading && f.activation == activation {
+                            f.state = FiberState::Unloading;
+                        }
+                    }
+                    Self::service_dependents_locked(&st, id)
+                };
+                // Stop consumers while this provider's resources are still
+                // available, then unwind the provider's partial effects.
+                for dep in affected {
+                    let _ = Box::pin(self.unload_fiber(dep, true)).await;
+                }
+                let failures = self.dispose_phase(id).await;
+                self.remove_fiber_services(id);
                 self.purge_fiber_registrations(id);
                 {
                     let mut st = self.lock_state();
                     if let Some(f) = st.fibers.get_mut(&id) {
-                        if matches!(f.state, FiberState::Loading | FiberState::Unloading) {
+                        if f.activation == activation
+                            && matches!(f.state, FiberState::Loading | FiberState::Unloading)
+                        {
                             f.state = FiberState::Failed;
+                            f.error = Some(if failures.is_empty() {
+                                err.to_string()
+                            } else {
+                                format!("{err}; cleanup failures: {failures:?}")
+                            });
                         }
-                        f.error = Some(err.to_string());
                     }
-                }
-                for dep in affected {
-                    let _ = Box::pin(self.unload_fiber(dep, true)).await;
                 }
             }
         }
@@ -559,10 +628,7 @@ impl AppInner {
     /// reentrant storms: nested calls (from `apply` → `provide`) return
     /// immediately and let the outer loop re-collect.
     pub(crate) async fn wake_pending(&self) {
-        if self
-            .waking
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.waking.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         // Drop guard: a panic anywhere below (e.g. inside a listener tap)
@@ -593,7 +659,10 @@ impl AppInner {
                 Box::pin(self.try_progress(id)).await;
                 let after = {
                     let st = self.lock_state();
-                    st.fibers.get(&id).map(|f| f.state).unwrap_or(FiberState::Disposed)
+                    st.fibers
+                        .get(&id)
+                        .map(|f| f.state)
+                        .unwrap_or(FiberState::Disposed)
                 };
                 if after != before {
                     progressed = true;
@@ -620,41 +689,56 @@ impl AppInner {
         }
     }
 
-    /// Unload a fiber: children first (reverse order), then own disposers
-    /// (reverse registration order) under a timeout, then remove provided
-    /// services and cascade to dependents. With `repend`, the fiber itself
-    /// returns to `Pending` (its entry is retained) instead of `Disposed` —
-    /// this is the "unload and reload when the service returns" semantics.
+    /// Unload a fiber. Service consumers are stopped before the provider's
+    /// resources are released. Own effects then unwind in reverse registration
+    /// order. With `repend`, the fiber remains declared and waits for its
+    /// dependencies to return.
     pub(crate) async fn unload_fiber(&self, id: FiberId, repend: bool) -> Result<(), Error> {
-        {
+        let failures = self.unload_fiber_collect(id, repend).await;
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::DisposeFailures(failures))
+        }
+    }
+
+    async fn unload_fiber_collect(&self, id: FiberId, repend: bool) -> Vec<DisposeFailure> {
+        let affected = {
             let mut st = self.lock_state();
             let Some(f) = st.fibers.get_mut(&id) else {
-                return Ok(());
+                return Vec::new();
             };
             match f.state {
                 // Pending is explicitly disposable too: unmounting a fiber
                 // that never activated just removes its entry (nucleus
                 // unmounts rows regardless of whether they ever ran).
-                FiberState::Pending | FiberState::Active | FiberState::Failed | FiberState::Loading => {
+                FiberState::Pending
+                | FiberState::Active
+                | FiberState::Failed
+                | FiberState::Loading => {
                     f.state = FiberState::Unloading;
                 }
-                _ => return Ok(()),
+                _ => return Vec::new(),
             }
+            Self::service_dependents_locked(&st, id)
+        };
+
+        // Dependents must release borrowed resources before this provider's
+        // disposer closes them. Marking the provider Unloading above also
+        // prevents new fibers from resolving its services.
+        let mut failures = Vec::new();
+        for dep in affected {
+            failures.extend(Box::pin(self.unload_fiber_collect(dep, true)).await);
         }
 
-        // Children are unwound by the child-unload disposers on this
-        // fiber's LIFO stack (pushed at mount time), so teardown order is
-        // exactly reverse registration order.
-        self.dispose_phase(id).await;
+        // Children are represented at their exact registration position in
+        // this fiber's disposer stack, preserving local LIFO semantics.
+        failures.extend(self.dispose_phase(id).await);
 
-        // Remove provided services in one critical section (mem::take, so
-        // a provide racing the drain cannot slip past it) and collect the
-        // dependents that must restart. Central purge afterwards keeps
-        // routes/taps from outliving the fiber even if a disposer hung and
-        // was dropped by the unload timeout.
+        // Central cleanup remains idempotent even if a disposer failed.
         self.purge_fiber_registrations(id);
         let parent = self.lock_state().fibers.get(&id).and_then(|f| f.parent);
-        let affected = self.remove_fiber_services(id);
+        self.remove_fiber_services(id);
         {
             let mut st = self.lock_state();
             if let Some(p) = parent {
@@ -667,30 +751,31 @@ impl AppInner {
                 f.children.clear();
                 f.provides.clear();
             }
-            if repend {
+            if repend && failures.is_empty() {
                 // Retain the entry: the fiber waits for its services to
                 // return, then remounts from the same plugin.
                 if let Some(f) = st.fibers.get_mut(&id) {
                     f.state = FiberState::Pending;
                     f.error = None;
                 }
+            } else if repend {
+                if let Some(f) = st.fibers.get_mut(&id) {
+                    f.state = FiberState::Failed;
+                    f.error = Some(format!("{failures:?}"));
+                }
             } else {
                 st.fibers.remove(&id);
             }
         }
 
-        for dep in affected {
-            Box::pin(self.unload_fiber(dep, true)).await?;
-        }
-
         self.wake_pending().await;
-        Ok(())
+        failures
     }
 
     /// Run the fiber's disposers in reverse registration order, bounded by
-    /// the configured unload timeout. On timeout the fiber is still marked
-    /// torn down (best-effort semantics, recorded in `error`).
-    pub(crate) async fn dispose_phase(&self, id: FiberId) {
+    /// the configured unload timeout. Every failure completed before the
+    /// deadline is retained; a timeout stops the remaining cleanup work.
+    pub(crate) async fn dispose_phase(&self, id: FiberId) -> Vec<DisposeFailure> {
         let (disposers, timeout, name) = {
             let mut st = self.lock_state();
             let disposers = st
@@ -707,29 +792,61 @@ impl AppInner {
             (disposers, timeout, name)
         };
         if disposers.is_empty() {
-            return;
+            return Vec::new();
         }
-        let work = async {
-            for d in disposers.into_iter().rev() {
-                d().await;
-            }
-        };
+        let mut failures = Vec::new();
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if let Err(_elapsed) = tokio::time::timeout(timeout, work).await {
-                let msg = format!("unload timed out after {:?}", timeout);
-                tracing::error!(fiber = id, plugin = %name, %msg);
-                let mut st = self.lock_state();
-                if let Some(f) = st.fibers.get_mut(&id) {
-                    f.error = Some(msg.clone());
+            let deadline = tokio::time::Instant::now() + timeout;
+            for disposer in disposers.into_iter().rev() {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    failures.push(DisposeFailure {
+                        fiber_id: id,
+                        plugin: name.clone(),
+                        message: format!("unload timed out after {timeout:?}"),
+                    });
+                    break;
+                }
+                match tokio::time::timeout_at(deadline, disposer()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(message)) => failures.push(DisposeFailure {
+                        fiber_id: id,
+                        plugin: name.clone(),
+                        message,
+                    }),
+                    Err(_) => {
+                        failures.push(DisposeFailure {
+                            fiber_id: id,
+                            plugin: name.clone(),
+                            message: format!("unload timed out after {timeout:?}"),
+                        });
+                        break;
+                    }
                 }
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (timeout, name);
-            work.await;
+            for disposer in disposers.into_iter().rev() {
+                if let Err(message) = disposer().await {
+                    failures.push(DisposeFailure {
+                        fiber_id: id,
+                        plugin: name.clone(),
+                        message,
+                    });
+                }
+            }
         }
+        if !failures.is_empty() {
+            let message = format!("{failures:?}");
+            tracing::error!(fiber = id, plugin = %name, "fiber cleanup failed: {message}");
+            if let Some(fiber) = self.lock_state().fibers.get_mut(&id) {
+                fiber.error = Some(message);
+            }
+        }
+        failures
     }
 }
 
@@ -739,24 +856,37 @@ impl AppInner {
 
 #[async_trait::async_trait]
 impl Host for AppInner {
-    fn push_disposer(&self, fiber: FiberId, disposer: Disposer) {
+    fn push_disposer(
+        &self,
+        fiber: FiberId,
+        activation: u64,
+        disposer: Disposer,
+    ) -> Option<Disposer> {
         let mut st = self.lock_state();
         match st.fibers.get_mut(&fiber) {
-            Some(f) if matches!(f.state, FiberState::Loading | FiberState::Active) => {
+            Some(f)
+                if f.activation == activation
+                    && matches!(f.state, FiberState::Loading | FiberState::Active) =>
+            {
                 f.disposers.push(disposer);
+                None
             }
             _ => {
                 tracing::warn!(
                     fiber,
-                    "effect registered on a non-live fiber; dropping"
+                    activation,
+                    "effect registered on a stale activation; disposing immediately"
                 );
+                Some(disposer)
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn provide_service(
         &self,
         fiber: FiberId,
+        activation: u64,
         scope: ScopeId,
         name: &str,
         value: Box<dyn CloneAny>,
@@ -768,14 +898,22 @@ impl Host for AppInner {
             return Err(Error::Shutdown);
         }
         if !matches!(
-            st.fibers.get(&fiber).map(|f| f.state),
-            Some(FiberState::Loading) | Some(FiberState::Active)
+            st.fibers.get(&fiber).map(|f| (f.state, f.activation)),
+            Some((FiberState::Loading | FiberState::Active, current)) if current == activation
         ) {
             return Err(Error::FiberNotLive(fiber));
         }
         let key = (scope, name.to_string());
-        if st.services.contains_key(&key) {
-            return Err(Error::ServiceExists(name.to_string()));
+        if let Some(existing) = st.services.get(&key) {
+            let replaceable = matches!(
+                st.fibers
+                    .get(&existing.provider)
+                    .map(|provider| provider.state),
+                Some(FiberState::Unloading | FiberState::Disposed | FiberState::Failed) | None
+            );
+            if !replaceable {
+                return Err(Error::ServiceExists(name.to_string()));
+            }
         }
         st.services.insert(
             key,
@@ -799,14 +937,7 @@ impl Host for AppInner {
         type_id: TypeId,
     ) -> Result<Box<dyn CloneAny>> {
         let st = self.lock_state();
-        let entry = st
-            .services
-            .get(&(scope, name.to_string()))
-            .or_else(|| {
-                (scope != GLOBAL)
-                    .then(|| st.services.get(&(GLOBAL, name.to_string())))
-                    .flatten()
-            });
+        let entry = st.service_entry(scope, name);
         let Some(entry) = entry else {
             return Err(Error::ServiceMissing(name.to_string()));
         };
@@ -827,6 +958,7 @@ impl Host for AppInner {
     fn add_plain_listener(
         &self,
         fiber: FiberId,
+        activation: u64,
         name: &str,
         handler: PlainBox,
     ) -> Result<u64> {
@@ -835,8 +967,8 @@ impl Host for AppInner {
             return Err(Error::Shutdown);
         }
         if !matches!(
-            st.fibers.get(&fiber).map(|f| f.state),
-            Some(FiberState::Loading) | Some(FiberState::Active)
+            st.fibers.get(&fiber).map(|f| (f.state, f.activation)),
+            Some((FiberState::Loading | FiberState::Active, current)) if current == activation
         ) {
             return Err(Error::FiberNotLive(fiber));
         }
@@ -849,6 +981,7 @@ impl Host for AppInner {
             .push(ListenerEntry {
                 id,
                 owner: fiber,
+                activation,
                 handler,
             });
         Ok(id)
@@ -857,6 +990,7 @@ impl Host for AppInner {
     fn add_waterfall_listener(
         &self,
         fiber: FiberId,
+        activation: u64,
         name: &str,
         handler: WaterfallBox,
         prepend: bool,
@@ -866,8 +1000,8 @@ impl Host for AppInner {
             return Err(Error::Shutdown);
         }
         if !matches!(
-            st.fibers.get(&fiber).map(|f| f.state),
-            Some(FiberState::Loading) | Some(FiberState::Active)
+            st.fibers.get(&fiber).map(|f| (f.state, f.activation)),
+            Some((FiberState::Loading | FiberState::Active, current)) if current == activation
         ) {
             return Err(Error::FiberNotLive(fiber));
         }
@@ -876,6 +1010,7 @@ impl Host for AppInner {
         let entry = ListenerEntry {
             id,
             owner: fiber,
+            activation,
             handler,
         };
         let route = st.routes.entry(name.to_string()).or_default();
@@ -907,7 +1042,7 @@ impl Host for AppInner {
         }
     }
 
-    fn snapshot_plain(&self, name: &str) -> Vec<(FiberId, ScopeId, PlainBox)> {
+    fn snapshot_plain(&self, name: &str) -> Vec<(FiberId, u64, ScopeId, PlainBox)> {
         let st = self.lock_state();
         st.routes
             .get(name)
@@ -915,12 +1050,8 @@ impl Host for AppInner {
                 r.plain
                     .iter()
                     .map(|e| {
-                        let scope = st
-                            .fibers
-                            .get(&e.owner)
-                            .map(|f| f.scope)
-                            .unwrap_or(GLOBAL);
-                        (e.owner, scope, e.handler.clone())
+                        let scope = st.fibers.get(&e.owner).map(|f| f.scope).unwrap_or(GLOBAL);
+                        (e.owner, e.activation, scope, e.handler.clone())
                     })
                     .collect()
             })
@@ -946,11 +1077,12 @@ impl Host for AppInner {
             .self_weak
             .upgrade()
             .expect("AppInner dropped while still in use");
-        for (owner, scope, handler) in entries {
+        for (owner, activation, scope, handler) in entries {
             let ctx = crate::context::Context {
                 host: host.clone() as Arc<dyn Host>,
                 fiber: owner,
                 scope,
+                activation,
             };
             let payload = payload.clone();
             #[cfg(not(target_arch = "wasm32"))]
@@ -962,14 +1094,14 @@ impl Host for AppInner {
         }
     }
 
-    fn add_tap(&self, fiber: FiberId, handler: TapBox) -> Result<u64> {
+    fn add_tap(&self, fiber: FiberId, activation: u64, handler: TapBox) -> Result<u64> {
         let mut st = self.lock_state();
         if st.shut_down {
             return Err(Error::Shutdown);
         }
         if !matches!(
-            st.fibers.get(&fiber).map(|f| f.state),
-            Some(FiberState::Loading) | Some(FiberState::Active)
+            st.fibers.get(&fiber).map(|f| (f.state, f.activation)),
+            Some((FiberState::Loading | FiberState::Active, current)) if current == activation
         ) {
             return Err(Error::FiberNotLive(fiber));
         }
@@ -978,6 +1110,7 @@ impl Host for AppInner {
         st.taps.push(ListenerEntry {
             id,
             owner: fiber,
+            activation,
             handler,
         });
         Ok(id)
@@ -991,9 +1124,19 @@ impl Host for AppInner {
     async fn mount_child(
         &self,
         parent: FiberId,
+        activation: u64,
         spec: crate::plugin::MountSpec,
     ) -> Result<FiberId> {
-        self.mount_fiber(Some(parent), spec).await
+        if !matches!(
+            self.lock_state()
+                .fibers
+                .get(&parent)
+                .map(|f| (f.state, f.activation)),
+            Some((FiberState::Loading | FiberState::Active, current)) if current == activation
+        ) {
+            return Err(Error::FiberNotLive(parent));
+        }
+        self.mount_fiber(Some(parent), Some(activation), spec).await
     }
 
     fn fiber_is_live(&self, fiber: FiberId) -> bool {

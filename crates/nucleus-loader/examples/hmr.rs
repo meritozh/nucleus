@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = loader.load_file(&cfg).await?;
     println!("initial: {}", report.summary());
 
-    std::fs::write(&cfg, "- id: a\n  name: alpha\n  config: {k: 1}\n- id: b\n  name: beta\n")?;
+    std::fs::write(
+        &cfg,
+        "- id: a\n  name: alpha\n  config: {k: 1}\n- id: b\n  name: beta\n",
+    )?;
     let report = loader.load_file(&cfg).await?;
     println!("edited:  {}", report.summary());
 
@@ -56,7 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // then live HMR: edit the file while this is running
     let handle = nucleus_loader::hmr::spawn_hmr(app, cfg.clone());
-    println!("\nwatching {} — edit it live, Ctrl-C to stop", cfg.display());
+    println!(
+        "\nwatching {} — edit it live, Ctrl-C to stop",
+        cfg.display()
+    );
     tokio::signal::ctrl_c().await.ok();
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);

@@ -15,9 +15,9 @@
 //! async call-service bridge; the host exercises instantiate / init /
 //! dispose-effect against the actual component-model-async ABI.
 
+use futures::future::BoxFuture;
 use nucleus_core::{App, Event, FiberState, Invokable, MountSpec};
 use nucleus_wasm::WasmSource;
-use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -42,8 +42,7 @@ impl Invokable for Calc {
         Box::pin(async move {
             match method.as_str() {
                 "add" => {
-                    let nums: Vec<u64> =
-                        serde_json::from_value(arg).map_err(|e| e.to_string())?;
+                    let nums: Vec<u64> = serde_json::from_value(arg).map_err(|e| e.to_string())?;
                     Ok(Value::from(nums.iter().sum::<u64>()))
                 }
                 other => Err(format!("unknown method `{other}`")),
@@ -70,7 +69,9 @@ async fn app_with_guest() -> (App, Arc<Mutex<Vec<String>>>) {
         }
     })
     .unwrap();
-    ctx.provide::<dyn Invokable>("calc", Arc::new(Calc)).await.unwrap();
+    ctx.provide::<dyn Invokable>("calc", Arc::new(Calc))
+        .await
+        .unwrap();
     (app, logs)
 }
 
@@ -136,7 +137,10 @@ async fn remount_gets_a_fresh_guest_instance() {
     f1.dispose().await.unwrap();
     drain().await;
     let after_first = logs.lock().unwrap().len();
-    assert!(after_first >= 3, "init x2 events + calc + dispose: {after_first}");
+    assert!(
+        after_first >= 3,
+        "init x2 events + calc + dispose: {after_first}"
+    );
 
     // a fresh mount must run init again (reload = new instance)
     let f2 = app

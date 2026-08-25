@@ -18,17 +18,15 @@
 //! (which is `AsContextMut`, needed to create streams); exported async
 //! functions are called through `Store::run_concurrent` + `Accessor`.
 
-use nucleus_core::{Context, Error, Invokable};
-use nucleus_core::Plugin as CorePlugin;
 use futures::future::BoxFuture;
+use nucleus_core::Plugin as CorePlugin;
+use nucleus_core::{Context, Error, Invokable};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::{Context as TaskContext, Poll};
-use wasmtime::component::{
-    Destination, StreamReader, StreamProducer, StreamResult, VecBuffer,
-};
+use wasmtime::component::{Destination, StreamProducer, StreamReader, StreamResult, VecBuffer};
 use wasmtime::{Config, Engine, Store};
 
 wasmtime::component::bindgen!({
@@ -271,9 +269,7 @@ impl CorePlugin for WasmPlugin {
                 let Session { store, bindings } = &mut *guard;
                 let bindings: &Plugin = &*bindings;
                 store
-                    .run_concurrent(async |accessor| {
-                        bindings.call_init(accessor, config).await
-                    })
+                    .run_concurrent(async |accessor| bindings.call_init(accessor, config).await)
                     .await
                     .map_err(werr)?
             };
@@ -303,7 +299,12 @@ impl nucleus::host::host::Host for HostState {
     fn register_effect(&mut self, label: String) -> u64 {
         let id = self.next_effect;
         self.next_effect += 1;
-        tracing::debug!(fiber = self.ctx.fiber_id(), label, id, "guest effect registered");
+        tracing::debug!(
+            fiber = self.ctx.fiber_id(),
+            label,
+            id,
+            "guest effect registered"
+        );
 
         // Wire a real disposer: at unload, call the guest's dispose-effect
         // export with this id. LIFO ordering comes from the fiber's
@@ -312,26 +313,27 @@ impl nucleus::host::host::Host for HostState {
         let session = self.session.clone();
         let ctx = self.ctx.clone();
         let fuel = self.fuel;
-        ctx.effect_fn(move || {
+        ctx.try_effect_fn(move || {
             let session = session.clone();
             Box::pin(async move {
-                if let Some(session) = session.upgrade() {
-                    let mut guard = session.lock().await;
-                    if let Err(e) = guard.store.set_fuel(fuel) {
-                        tracing::warn!(id, error = %e, "cannot re-arm fuel before dispose");
-                        return;
-                    }
-                    let Session { store, bindings } = &mut *guard;
-                    let bindings: &Plugin = &*bindings;
-                    if let Err(e) = store
-                        .run_concurrent(async |accessor| {
-                            bindings.call_dispose_effect(accessor, id).await
-                        })
-                        .await
-                    {
-                        tracing::warn!(id, error = %e, "guest dispose-effect trapped");
-                    }
-                }
+                let session = session
+                    .upgrade()
+                    .ok_or_else(|| "guest session dropped before dispose-effect".to_string())?;
+                let mut guard = session.lock().await;
+                guard
+                    .store
+                    .set_fuel(fuel)
+                    .map_err(|e| format!("cannot re-arm fuel before dispose-effect: {e}"))?;
+                let Session { store, bindings } = &mut *guard;
+                let bindings: &Plugin = &*bindings;
+                let outcome = store
+                    .run_concurrent(async |accessor| {
+                        bindings.call_dispose_effect(accessor, id).await
+                    })
+                    .await
+                    .map_err(|e| format!("guest dispose-effect trapped: {e}"))?
+                    .map_err(|e| format!("guest dispose-effect trapped: {e}"))?;
+                outcome.map_err(|()| "guest dispose-effect returned an error".to_string())
             })
         });
         id
@@ -363,16 +365,18 @@ impl Invokable for GuestInvokable {
                 .upgrade()
                 .ok_or_else(|| "guest session dropped".to_string())?;
             let mut guard = session.lock().await;
-            guard
-                .store
-                .set_fuel(fuel)
-                .map_err(|e| e.to_string())?;
+            guard.store.set_fuel(fuel).map_err(|e| e.to_string())?;
             let Session { store, bindings } = &mut *guard;
             let bindings: &Plugin = &*bindings;
             let result = store
                 .run_concurrent(async |accessor| {
                     bindings
-                        .call_handle_service(accessor, service.clone(), method.clone(), arg_str.clone())
+                        .call_handle_service(
+                            accessor,
+                            service.clone(),
+                            method.clone(),
+                            arg_str.clone(),
+                        )
                         .await
                 })
                 .await;
@@ -387,62 +391,58 @@ impl Invokable for GuestInvokable {
 }
 
 impl nucleus::host::host::HostWithStore<HostState> for wasmtime::component::HasSelf<HostState> {
-    fn subscribe(
+    async fn subscribe(
         accessor: &wasmtime::component::Accessor<HostState, Self>,
         pattern: String,
-    ) -> impl ::core::future::Future<Output = StreamReader<Event>> + Send {
-        async move {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
-            accessor.with(|mut a| {
-                a.data_mut()
-                    .registry
-                    .channels
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((pattern, tx));
-            });
-            accessor.with(|mut a| {
-                StreamReader::new(&mut a, ChannelProducer::new(rx))
-                    .expect("create guest event stream (table full / no concurrency?)")
-            })
-        }
+    ) -> StreamReader<Event> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+        accessor.with(|mut a| {
+            a.data_mut()
+                .registry
+                .channels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((pattern, tx));
+        });
+        accessor.with(|mut a| {
+            StreamReader::new(&mut a, ChannelProducer::new(rx))
+                .expect("create guest event stream (table full / no concurrency?)")
+        })
     }
 
-    fn call_service(
+    async fn call_service(
         accessor: &wasmtime::component::Accessor<HostState, Self>,
         service: String,
         method: String,
         arg: String,
-    ) -> impl ::core::future::Future<Output = Result<String, String>> + Send {
-        async move {
-            let svc = accessor.with(|mut a| a.data_mut().ctx.try_service::<dyn Invokable>(&service));
-            let arg: Value = serde_json::from_str(&arg).unwrap_or(Value::Null);
-            match svc {
-                Some(s) => match s.invoke(&method, arg).await {
-                    Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
-                    Err(e) => Err(e),
-                },
-                None => Err(format!("service `{service}` not invokable")),
-            }
+    ) -> Result<String, String> {
+        let svc = accessor.with(|mut a| a.data_mut().ctx.try_service::<dyn Invokable>(&service));
+        let arg: Value = serde_json::from_str(&arg).unwrap_or(Value::Null);
+        match svc {
+            Some(s) => match s.invoke(&method, arg).await {
+                Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+                Err(e) => Err(e),
+            },
+            None => Err(format!("service `{service}` not invokable")),
         }
     }
 
-    fn provide_service(
+    async fn provide_service(
         accessor: &wasmtime::component::Accessor<HostState, Self>,
         name: String,
-    ) -> impl ::core::future::Future<Output = Result<(), ()>> + Send {
-        async move {
-            let (ctx, session, fuel) = accessor.with(|mut a| {
-                let s = a.data_mut();
-                (s.ctx.clone(), s.session.clone(), s.fuel)
-            });
-            let svc = Arc::new(GuestInvokable {
-                service: name.clone(),
-                session,
-                fuel,
-            });
-            ctx.provide::<dyn Invokable>(&name, svc).await.map_err(|_| ())
-        }
+    ) -> Result<(), ()> {
+        let (ctx, session, fuel) = accessor.with(|mut a| {
+            let s = a.data_mut();
+            (s.ctx.clone(), s.session.clone(), s.fuel)
+        });
+        let svc = Arc::new(GuestInvokable {
+            service: name.clone(),
+            session,
+            fuel,
+        });
+        ctx.provide::<dyn Invokable>(&name, svc)
+            .await
+            .map_err(|_| ())
     }
 }
 
@@ -547,26 +547,46 @@ mod tests {
     fn memory_limiter_caps_growth() {
         fn grow(
             lim: &mut MemoryLimiter,
-            f: fn(
-                &mut MemoryLimiter,
-                usize,
-                usize,
-                Option<usize>,
-            ) -> Result<bool, wasmtime::Error>,
+            f: fn(&mut MemoryLimiter, usize, usize, Option<usize>) -> Result<bool, wasmtime::Error>,
             current: usize,
             desired: usize,
         ) -> bool {
             f(lim, current, desired, None).unwrap()
         }
         let mut lim = MemoryLimiter(1000);
-        assert!(grow(&mut lim, wasmtime::ResourceLimiter::memory_growing, 0, 1000));
+        assert!(grow(
+            &mut lim,
+            wasmtime::ResourceLimiter::memory_growing,
+            0,
+            1000
+        ));
         assert!(
-            grow(&mut lim, wasmtime::ResourceLimiter::memory_growing, 900, 800),
+            grow(
+                &mut lim,
+                wasmtime::ResourceLimiter::memory_growing,
+                900,
+                800
+            ),
             "shrink ok"
         );
-        assert!(!grow(&mut lim, wasmtime::ResourceLimiter::memory_growing, 900, 1001));
-        assert!(grow(&mut lim, wasmtime::ResourceLimiter::table_growing, 0, 999_999));
-        assert!(!grow(&mut lim, wasmtime::ResourceLimiter::table_growing, 0, 1_000_001));
+        assert!(!grow(
+            &mut lim,
+            wasmtime::ResourceLimiter::memory_growing,
+            900,
+            1001
+        ));
+        assert!(grow(
+            &mut lim,
+            wasmtime::ResourceLimiter::table_growing,
+            0,
+            999_999
+        ));
+        assert!(!grow(
+            &mut lim,
+            wasmtime::ResourceLimiter::table_growing,
+            0,
+            1_000_001
+        ));
     }
 
     #[test]
@@ -576,7 +596,10 @@ mod tests {
         assert_eq!(l.memory_bytes, 64 * 1024 * 1024);
 
         let src = WasmSource::new("/tmp/plugins");
-        assert_eq!(src.resolve("hello"), std::path::Path::new("/tmp/plugins/hello.wasm"));
+        assert_eq!(
+            src.resolve("hello"),
+            std::path::Path::new("/tmp/plugins/hello.wasm")
+        );
         assert_eq!(
             src.resolve("nested/thing.wasm"),
             std::path::Path::new("/tmp/plugins/nested/thing.wasm"),

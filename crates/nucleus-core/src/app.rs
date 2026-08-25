@@ -2,13 +2,11 @@
 //! mount / unload / cascade-reload.
 
 use crate::context::Context;
-use crate::error::Result;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::fiber::FiberState;
-use crate::fiber::{FiberHandle, FiberId, FiberInfo, ScopeId, GLOBAL};
-use crate::plugin::{MountSpec, PluginSource, StaticSource};
+use crate::error::{DisposeFailure, Error, Result};
+use crate::fiber::{FiberHandle, FiberId, FiberInfo, FiberState, ScopeId, GLOBAL};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::plugin::Plugin;
+use crate::plugin::{MountSpec, PluginSource, StaticSource};
 use crate::state::AppInner;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::state::{AppState, FiberData};
@@ -87,6 +85,7 @@ impl App {
                 config: Value::Null,
                 plugin: Arc::new(RootPlugin),
                 state: FiberState::Active,
+                activation: 0,
                 parent: None,
                 children: Vec::new(),
                 inject: Vec::new(),
@@ -132,6 +131,7 @@ impl App {
             host: self.inner.clone() as Arc<dyn crate::state::Host>,
             fiber: 0,
             scope: GLOBAL,
+            activation: 0,
         }
     }
 
@@ -142,23 +142,83 @@ impl App {
             host: self.inner.clone() as Arc<dyn crate::state::Host>,
             fiber: 0,
             scope,
+            activation: 0,
         }
     }
 
     /// Mount a root-level plugin.
     pub async fn mount(&self, spec: MountSpec) -> Result<FiberHandle> {
-        let id = self.inner.mount_fiber(None, spec).await?;
+        let id = self.inner.mount_fiber(None, None, spec).await?;
         Ok(FiberHandle {
             app: self.inner.clone(),
             id,
         })
     }
 
+    /// Mount a complete required plugin set.
+    ///
+    /// Pending or failed fibers make the batch fail. Every fiber created by
+    /// this call is then disposed in reverse order before the error is
+    /// returned, so callers never publish a partially active application.
+    pub async fn mount_batch<I>(&self, specs: I) -> Result<Vec<FiberHandle>>
+    where
+        I: IntoIterator<Item = MountSpec>,
+    {
+        let mut mounted = Vec::new();
+        for spec in specs {
+            match self.mount(spec).await {
+                Ok(handle) => mounted.push(handle),
+                Err(error) => {
+                    let rollback = rollback_handles(&mut mounted).await;
+                    return Err(Error::BatchMountFailed {
+                        reason: error.to_string(),
+                        rollback,
+                    });
+                }
+            }
+        }
+
+        let inactive = mounted
+            .iter()
+            .filter_map(|handle| {
+                let info = handle.info()?;
+                (info.state != FiberState::Active).then_some(info)
+            })
+            .map(|info| {
+                if let Some(error) = info.error {
+                    format!("{} is {}: {error}", info.name, info.state)
+                } else if info.missing.is_empty() {
+                    format!("{} is {}", info.name, info.state)
+                } else {
+                    format!(
+                        "{} is {} (missing: {})",
+                        info.name,
+                        info.state,
+                        info.missing.join(", ")
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        if !inactive.is_empty() {
+            let rollback = rollback_handles(&mut mounted).await;
+            return Err(Error::BatchMountFailed {
+                reason: format!("required plugins did not activate: {}", inactive.join("; ")),
+                rollback,
+            });
+        }
+
+        Ok(mounted)
+    }
+
     pub fn fiber(&self, id: FiberId) -> Option<FiberHandle> {
-        self.inner.lock_state().fibers.contains_key(&id).then(|| FiberHandle {
-            app: self.inner.clone(),
-            id,
-        })
+        self.inner
+            .lock_state()
+            .fibers
+            .contains_key(&id)
+            .then(|| FiberHandle {
+                app: self.inner.clone(),
+                id,
+            })
     }
 
     /// All fibers with diagnostics; PENDING fibers include their missing
@@ -204,10 +264,45 @@ impl App {
             st.shut_down = true;
             st.roots.clone()
         };
+        let mut failures = Vec::new();
         for id in roots.into_iter().rev() {
-            self.inner.unload_fiber(id, false).await?;
+            if let Err(error) = self.inner.unload_fiber(id, false).await {
+                append_dispose_error(&mut failures, id, "app", error);
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::DisposeFailures(failures))
+        }
+    }
+}
+
+async fn rollback_handles(handles: &mut Vec<FiberHandle>) -> Vec<DisposeFailure> {
+    let mut failures = Vec::new();
+    while let Some(handle) = handles.pop() {
+        let id = handle.id();
+        let name = handle.name().unwrap_or_else(|| "unknown".to_string());
+        if let Err(error) = handle.dispose().await {
+            append_dispose_error(&mut failures, id, &name, error);
+        }
+    }
+    failures
+}
+
+fn append_dispose_error(
+    failures: &mut Vec<DisposeFailure>,
+    fiber_id: FiberId,
+    plugin: &str,
+    error: Error,
+) {
+    match error {
+        Error::DisposeFailures(mut nested) => failures.append(&mut nested),
+        other => failures.push(DisposeFailure {
+            fiber_id,
+            plugin: plugin.to_string(),
+            message: other.to_string(),
+        }),
     }
 }
 

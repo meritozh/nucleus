@@ -1,5 +1,12 @@
 use std::any::TypeId;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisposeFailure {
+    pub fiber_id: u64,
+    pub plugin: String,
+    pub message: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("service `{0}` already provided in this scope")]
@@ -29,6 +36,15 @@ pub enum Error {
 
     #[error("unload of fiber `{0}` timed out after {1:?}; state may be partially torn down")]
     UnloadTimeout(String, std::time::Duration),
+
+    #[error("one or more fiber disposers failed: {0:?}")]
+    DisposeFailures(Vec<DisposeFailure>),
+
+    #[error("batch mount failed: {reason}; rollback failures: {rollback:?}")]
+    BatchMountFailed {
+        reason: String,
+        rollback: Vec<DisposeFailure>,
+    },
 
     #[error("waterfall handler failed: {0}")]
     Waterfall(String),

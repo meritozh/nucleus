@@ -133,7 +133,10 @@ async fn inject_pending_then_activation_and_cascade_reload() {
         FiberState::Pending,
         "consumer waits again for the service to return"
     );
-    assert_eq!(consumer.info().unwrap().missing, vec!["greeter".to_string()]);
+    assert_eq!(
+        consumer.info().unwrap().missing,
+        vec!["greeter".to_string()]
+    );
 
     // 4. a *different* implementation mounts: consumer remounts against it
     let v2 = app

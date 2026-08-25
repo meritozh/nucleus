@@ -33,13 +33,13 @@
 //! nucleus_guest::export_plugin!(MyPlugin);
 //! ```
 
+use futures::future::BoxFuture;
 use nucleus_core::error::Error;
 use nucleus_core::events::{PlainBox, WaterfallBox};
 use nucleus_core::fiber::{FiberId, ScopeId};
 use nucleus_core::plugin::MountSpec;
 use nucleus_core::state::{CloneAny, Disposer, Host, TapBox};
 use nucleus_core::Invokable;
-use futures::future::BoxFuture;
 use serde_json::Value;
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -89,6 +89,7 @@ impl GuestHost {
             host: arc as Arc<dyn Host>,
             fiber: 1,
             scope: 0,
+            activation: 0,
         }
     }
 
@@ -102,15 +103,22 @@ impl GuestHost {
 
 #[async_trait::async_trait]
 impl Host for GuestHost {
-    fn push_disposer(&self, _fiber: FiberId, disposer: Disposer) {
+    fn push_disposer(
+        &self,
+        _fiber: FiberId,
+        _activation: u64,
+        disposer: Disposer,
+    ) -> Option<Disposer> {
         // Register the effect with the host so it calls us back at unload.
         let host_id = register_effect("effect");
         self.disposers.lock().unwrap().insert(host_id, disposer);
+        None
     }
 
     async fn provide_service(
         &self,
         _fiber: FiberId,
+        _activation: u64,
         _scope: ScopeId,
         name: &str,
         value: Box<dyn CloneAny>,
@@ -127,10 +135,7 @@ impl Host for GuestHost {
                     "only Invokable services can be provided from a Wasm guest".into(),
                 )
             })?;
-        self.services
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), svc);
+        self.services.lock().unwrap().insert(name.to_string(), svc);
         // Tell the host to register an Invokable that calls back into us.
         provide_service(name.to_string())
             .await
@@ -157,6 +162,7 @@ impl Host for GuestHost {
     fn add_plain_listener(
         &self,
         _fiber: FiberId,
+        _activation: u64,
         name: &str,
         handler: PlainBox,
     ) -> nucleus_core::Result<u64> {
@@ -179,6 +185,7 @@ impl Host for GuestHost {
     fn add_waterfall_listener(
         &self,
         _fiber: FiberId,
+        _activation: u64,
         _name: &str,
         _handler: WaterfallBox,
         _prepend: bool,
@@ -193,7 +200,7 @@ impl Host for GuestHost {
 
     fn remove_waterfall_listener(&self, _name: &str, _id: u64) {}
 
-    fn snapshot_plain(&self, _name: &str) -> Vec<(FiberId, ScopeId, PlainBox)> {
+    fn snapshot_plain(&self, _name: &str) -> Vec<(FiberId, u64, ScopeId, PlainBox)> {
         Vec::new()
     }
 
@@ -210,7 +217,12 @@ impl Host for GuestHost {
         nucleus::host::host::emit(name, &payload.to_string());
     }
 
-    fn add_tap(&self, _fiber: FiberId, handler: TapBox) -> nucleus_core::Result<u64> {
+    fn add_tap(
+        &self,
+        _fiber: FiberId,
+        _activation: u64,
+        handler: TapBox,
+    ) -> nucleus_core::Result<u64> {
         let id = self.next_id();
         let _stream = subscribe("*".to_string());
         let _ = handler;
@@ -222,6 +234,7 @@ impl Host for GuestHost {
     async fn mount_child(
         &self,
         _parent: FiberId,
+        _activation: u64,
         _spec: MountSpec,
     ) -> nucleus_core::Result<FiberId> {
         Err(Error::ApplyFailed(
@@ -253,11 +266,7 @@ struct GuestServiceInvoker {
 
 #[async_trait::async_trait]
 impl Invokable for GuestServiceInvoker {
-    fn invoke(
-        &self,
-        method: &str,
-        arg: Value,
-    ) -> BoxFuture<'static, Result<Value, String>> {
+    fn invoke(&self, method: &str, arg: Value) -> BoxFuture<'static, Result<Value, String>> {
         let service = self.service.clone();
         let method = method.to_string();
         let arg_str = arg.to_string();
@@ -274,7 +283,7 @@ impl Invokable for GuestServiceInvoker {
 // trait methods are free functions that can't capture state.
 thread_local! {
     pub static GUEST_HOST: std::cell::RefCell<Option<Arc<GuestHost>>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Emit a dispose marker on the `guest/log` event. Used by
@@ -318,7 +327,10 @@ macro_rules! export_plugin {
                         .and_then(|host| host.disposers.lock().unwrap().remove(&handle))
                 });
                 if let Some(disposer) = disposer {
-                    disposer().await;
+                    if let Err(error) = disposer().await {
+                        nucleus_core::tracing::error!(%error, "guest disposer failed");
+                        return Err(());
+                    }
                 }
                 // Emit a dispose marker so the host can observe that the
                 // effect was unwound with the correct handle.

@@ -4,7 +4,8 @@ use crate::error::{Error, Result};
 use crate::events::{DefaultBox, Event, Next, PlainBox, TypedNext, WaterfallBox, WaterfallEvent};
 use crate::fiber::{FiberHandle, ScopeId, GLOBAL};
 use crate::plugin::MountSpec;
-use crate::state::{Host, CloneAny};
+use crate::service::ServiceKey;
+use crate::state::{CloneAny, Host};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -24,6 +25,7 @@ pub struct Context {
     pub host: Arc<dyn Host>,
     pub fiber: crate::fiber::FiberId,
     pub scope: ScopeId,
+    pub activation: u64,
 }
 
 impl Context {
@@ -32,7 +34,8 @@ impl Context {
     pub fn app(&self) -> Option<crate::app::App> {
         let host = self.host.clone();
         // Cast Arc<dyn Host> to Arc<dyn Any> to downcast to AppInner.
-        let any: Arc<dyn std::any::Any + Send + Sync> = host as Arc<dyn std::any::Any + Send + Sync>;
+        let any: Arc<dyn std::any::Any + Send + Sync> =
+            host as Arc<dyn std::any::Any + Send + Sync>;
         match any.downcast::<crate::state::AppInner>() {
             Ok(inner) => Some(crate::app::App { inner }),
             Err(_) => None,
@@ -59,7 +62,20 @@ impl Context {
         DFut: Future<Output = ()> + Send + 'static,
     {
         let disposer = acquire.await;
-        self.push_disposer(Box::new(move || Box::pin(disposer())));
+        let disposer: crate::state::Disposer = Box::new(move || {
+            Box::pin(async move {
+                disposer().await;
+                Ok(())
+            })
+        });
+        if let Some(disposer) = self
+            .host
+            .push_disposer(self.fiber, self.activation, disposer)
+        {
+            if let Err(error) = disposer().await {
+                tracing::error!(fiber = self.fiber, %error, "stale effect cleanup failed");
+            }
+        }
     }
 
     /// `effect` without an acquisition step: just hand over the disposer.
@@ -68,11 +84,66 @@ impl Context {
         D: FnOnce() -> DFut + Send + 'static,
         DFut: Future<Output = ()> + Send + 'static,
     {
-        self.push_disposer(Box::new(move || Box::pin(disposer())));
+        self.push_disposer(Box::new(move || {
+            Box::pin(async move {
+                disposer().await;
+                Ok(())
+            })
+        }));
+    }
+
+    /// Register an external resource whose asynchronous cleanup may fail.
+    ///
+    /// Failures are collected with other disposer failures and returned from
+    /// [`crate::App::shutdown`] or [`FiberHandle::dispose`].
+    pub async fn try_effect<F, D, DFut, E>(&self, acquire: F)
+    where
+        F: Future<Output = D>,
+        D: FnOnce() -> DFut + Send + 'static,
+        DFut: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        let disposer = acquire.await;
+        let disposer: crate::state::Disposer = Box::new(move || {
+            Box::pin(async move { disposer().await.map_err(|error| error.to_string()) })
+        });
+        if let Some(disposer) = self
+            .host
+            .push_disposer(self.fiber, self.activation, disposer)
+        {
+            if let Err(error) = disposer().await {
+                tracing::error!(fiber = self.fiber, %error, "stale effect cleanup failed");
+            }
+        }
+    }
+
+    /// Fallible variant of [`Context::effect_fn`].
+    pub fn try_effect_fn<D, DFut, E>(&self, disposer: D)
+    where
+        D: FnOnce() -> DFut + Send + 'static,
+        DFut: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        self.push_disposer(Box::new(move || {
+            Box::pin(async move { disposer().await.map_err(|error| error.to_string()) })
+        }));
     }
 
     pub(crate) fn push_disposer(&self, disposer: crate::state::Disposer) {
-        self.host.push_disposer(self.fiber, disposer);
+        let Some(disposer) = self
+            .host
+            .push_disposer(self.fiber, self.activation, disposer)
+        else {
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        self.host.runtime().spawn(async move {
+            if let Err(error) = disposer().await {
+                tracing::error!(%error, "stale effect cleanup failed");
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        tracing::error!("guest host rejected an effect registration");
     }
 
     // ---- services ---------------------------------------------------------
@@ -88,6 +159,7 @@ impl Context {
         self.host
             .provide_service(
                 self.fiber,
+                self.activation,
                 self.scope,
                 name,
                 value,
@@ -97,6 +169,14 @@ impl Context {
             .await?;
         self.host.wake_pending().await;
         Ok(())
+    }
+
+    /// Provide a native service through a typed key.
+    pub async fn provide_key<T>(&self, key: ServiceKey<T>, svc: Arc<T>) -> Result<()>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.provide(key.name(), svc).await
     }
 
     /// Look up a required service. Inside `apply` with a matching `inject`
@@ -113,6 +193,14 @@ impl Context {
             .ok_or_else(|| Error::ServiceMissing(name.to_string()))
     }
 
+    /// Look up a required native service through a typed key.
+    pub fn service_key<T>(&self, key: ServiceKey<T>) -> Result<Arc<T>>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.service(key.name())
+    }
+
     /// Optional lookup (nucleus `ctx.get`): `None` when absent (including
     /// type mismatch).
     pub fn try_service<T>(&self, name: &str) -> Option<Arc<T>>
@@ -120,6 +208,14 @@ impl Context {
         T: ?Sized + Send + Sync + 'static,
     {
         self.service::<T>(name).ok()
+    }
+
+    /// Look up an optional native service through a typed key.
+    pub fn try_service_key<T>(&self, key: ServiceKey<T>) -> Option<Arc<T>>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.try_service(key.name())
     }
 
     // ---- events -----------------------------------------------------------
@@ -138,7 +234,9 @@ impl Context {
             Box::pin(async move {
                 match serde_json::from_value::<E>(payload) {
                     Ok(event) => handler(ctx, event).await,
-                    Err(e) => tracing::warn!(event = E::NAME, error = %e, "listener payload decode failed"),
+                    Err(e) => {
+                        tracing::warn!(event = E::NAME, error = %e, "listener payload decode failed")
+                    }
                 }
                 Value::Null
             })
@@ -198,7 +296,12 @@ impl Context {
         self.on_waterfall_opt::<E, F, Fut>(E::NAME, handler, true)
     }
 
-    fn on_waterfall_opt<E, F, Fut>(&self, name: &'static str, handler: F, prepend: bool) -> Result<()>
+    fn on_waterfall_opt<E, F, Fut>(
+        &self,
+        name: &'static str,
+        handler: F,
+        prepend: bool,
+    ) -> Result<()>
     where
         E: WaterfallEvent,
         F: Fn(Context, E::Args, TypedNext<E::Args, E::Output>) -> Fut + Send + Sync + 'static,
@@ -247,11 +350,12 @@ impl Context {
         self.host.notify_taps(E::NAME, &payload);
         let entries = self.snapshot_plain(E::NAME);
         let mut futs = Vec::with_capacity(entries.len());
-        for (owner, scope, handler) in entries {
+        for (owner, activation, scope, handler) in entries {
             let ctx = Context {
                 host: self.host.clone(),
                 fiber: owner,
                 scope,
+                activation,
             };
             let payload = payload.clone();
             futs.push(handler(ctx, payload));
@@ -276,11 +380,12 @@ impl Context {
         let payload = serde_json::to_value(event)?;
         self.host.notify_taps(E::NAME, &payload);
         let entries = self.snapshot_plain(E::NAME);
-        for (owner, scope, handler) in entries {
+        for (owner, activation, scope, handler) in entries {
             let ctx = Context {
                 host: self.host.clone(),
                 fiber: owner,
                 scope,
+                activation,
             };
             let answer = handler(ctx, payload.clone()).await;
             if !answer.is_null() {
@@ -329,7 +434,9 @@ impl Context {
         F: Fn(&str, &Value) + Send + Sync + 'static,
     {
         let host = self.host.clone();
-        let lid = self.host.add_tap(self.fiber, Arc::new(tap))?;
+        let lid = self
+            .host
+            .add_tap(self.fiber, self.activation, Arc::new(tap))?;
         self.effect_fn(move || {
             let host = host.clone();
             Box::pin(async move {
@@ -347,7 +454,10 @@ impl Context {
         if self.scope != GLOBAL {
             spec.scope = self.scope;
         }
-        let id = self.host.mount_child(self.fiber, spec).await?;
+        let id = self
+            .host
+            .mount_child(self.fiber, self.activation, spec)
+            .await?;
         // FiberHandle needs AppInner for unload; on the host this downcast
         // always succeeds. In a guest, mount_child returns an error first.
         let any: Arc<dyn std::any::Any + Send + Sync> =
@@ -363,7 +473,7 @@ impl Context {
     fn snapshot_plain(
         &self,
         name: &str,
-    ) -> Vec<(crate::fiber::FiberId, crate::fiber::ScopeId, PlainBox)> {
+    ) -> Vec<(crate::fiber::FiberId, u64, crate::fiber::ScopeId, PlainBox)> {
         self.host.snapshot_plain(name)
     }
 
@@ -373,7 +483,9 @@ impl Context {
 
     fn add_plain_listener(&self, name: &'static str, handler: PlainBox) -> Result<()> {
         let host = self.host.clone();
-        let lid = self.host.add_plain_listener(self.fiber, name, handler)?;
+        let lid = self
+            .host
+            .add_plain_listener(self.fiber, self.activation, name, handler)?;
         self.effect_fn(move || {
             let host = host.clone();
             let name = name.to_string();
@@ -391,9 +503,13 @@ impl Context {
         prepend: bool,
     ) -> Result<()> {
         let host = self.host.clone();
-        let lid = self
-            .host
-            .add_waterfall_listener(self.fiber, name, handler, prepend)?;
+        let lid = self.host.add_waterfall_listener(
+            self.fiber,
+            self.activation,
+            name,
+            handler,
+            prepend,
+        )?;
         self.effect_fn(move || {
             let host = host.clone();
             let name = name.to_string();

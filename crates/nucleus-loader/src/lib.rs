@@ -295,7 +295,9 @@ impl Loader {
                     let Some(row) = next_map.get(&id) else { continue };
                     if let Some(handle) = self.mounted.remove(&id) {
                         if let Err(e) = handle.dispose().await {
+                            failed_ids.push(id.clone());
                             report.failed.push((id.clone(), e.to_string()));
+                            continue;
                         }
                     }
                     if row.disabled {

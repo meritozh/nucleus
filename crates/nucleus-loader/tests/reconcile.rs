@@ -100,13 +100,56 @@ async fn unchanged_rows_do_not_remount() {
     // one row's config changes: only that row remounts
     let mut changed = row("a", "alpha");
     changed.config = json!({"k": 1});
-    let report = loader
-        .apply(vec![changed, row("b", "beta")])
-        .await
-        .unwrap();
+    let report = loader.apply(vec![changed, row("b", "beta")]).await.unwrap();
     assert_eq!(report.remounted, vec!["a"]);
     assert_eq!(a.load(Ordering::SeqCst), 2);
     assert_eq!(b.load(Ordering::SeqCst), 1);
+}
+
+struct FailingDisposePlugin {
+    mounts: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for FailingDisposePlugin {
+    fn name(&self) -> &str {
+        "failing-dispose"
+    }
+
+    async fn apply(&self, ctx: nucleus_core::Context) -> nucleus_core::Result<()> {
+        self.mounts.fetch_add(1, Ordering::SeqCst);
+        ctx.try_effect_fn(|| async { Err::<(), _>("planned dispose failure") });
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn reconfig_does_not_mount_after_dispose_failure() {
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let app = App::new().with_static(nucleus_core::static_source! {
+        "failing-dispose" => {
+            let mounts = mounts.clone();
+            move |_| Ok(Arc::new(FailingDisposePlugin { mounts: mounts.clone() }))
+        },
+    });
+    let mut loader = Loader::new(app);
+
+    loader
+        .apply(vec![row("failing", "failing-dispose")])
+        .await
+        .unwrap();
+    let mut changed = row("failing", "failing-dispose");
+    changed.config = json!({"revision": 2});
+    let report = loader.apply(vec![changed.clone()]).await.unwrap();
+
+    assert_eq!(mounts.load(Ordering::SeqCst), 1);
+    assert!(loader.fiber("failing").is_none());
+    assert_eq!(report.remounted, Vec::<String>::new());
+    assert_eq!(report.failed.len(), 1);
+
+    let retry = loader.apply(vec![changed]).await.unwrap();
+    assert_eq!(mounts.load(Ordering::SeqCst), 2);
+    assert_eq!(retry.mounted, vec!["failing"]);
 }
 
 #[tokio::test]
@@ -187,7 +230,11 @@ async fn hmr_reload_on_file_change() {
     std::fs::write(&cfg, "- id: a\n  name: alpha\n- id: b\n  name: beta\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     assert_eq!(b.load(Ordering::SeqCst), 1, "new row mounted after edit");
-    assert_eq!(a.load(Ordering::SeqCst), 1, "unchanged row NOT remounted by HMR");
+    assert_eq!(
+        a.load(Ordering::SeqCst),
+        1,
+        "unchanged row NOT remounted by HMR"
+    );
 
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
