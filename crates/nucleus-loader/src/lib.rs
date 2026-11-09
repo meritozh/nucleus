@@ -28,6 +28,12 @@ pub mod hmr;
 pub enum LoaderError {
     #[error("yaml parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    #[error("duplicate row id `{id}` at flattened rows {first} and {second}")]
+    DuplicateId {
+        id: String,
+        first: usize,
+        second: usize,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("mount error: {0}")]
@@ -96,6 +102,9 @@ pub struct ReconcileReport {
     pub remounted: Vec<String>,
     pub unmounted: Vec<String>,
     pub unchanged: usize,
+    /// Actual end-of-pass state; mounted/remounted describe operations.
+    pub active: Vec<String>,
+    pub pending: Vec<String>,
     pub failed: Vec<(String, String)>,
 }
 
@@ -181,10 +190,8 @@ fn resolve_into(
 /// Diff two resolved states by row id. Ops carry ids; rows are looked up
 /// by the caller in the `next` state.
 pub fn diff(prev: &[ResolvedRow], next: &[ResolvedRow]) -> Vec<Op> {
-    let prev_map: HashMap<&str, &ResolvedRow> =
-        prev.iter().map(|r| (r.id.as_str(), r)).collect();
-    let next_map: HashMap<&str, &ResolvedRow> =
-        next.iter().map(|r| (r.id.as_str(), r)).collect();
+    let prev_map: HashMap<&str, &ResolvedRow> = prev.iter().map(|r| (r.id.as_str(), r)).collect();
+    let next_map: HashMap<&str, &ResolvedRow> = next.iter().map(|r| (r.id.as_str(), r)).collect();
 
     let mut ops = Vec::new();
     // Unmounts first (reverse order of appearance), then mounts/reconfigs in
@@ -253,7 +260,19 @@ impl Loader {
     /// sense: a row that fails to mount is reported and skipped without
     /// unwinding the rest of the pass.
     pub async fn apply(&mut self, rows: Vec<Row>) -> Result<ReconcileReport> {
-        let next = resolve_with_scopes(&rows, &self.app, GLOBAL, &mut self.scopes);
+        let mut scopes = self.scopes.clone();
+        let next = resolve_with_scopes(&rows, &self.app, GLOBAL, &mut scopes);
+        let mut seen = HashMap::new();
+        for (i, row) in next.iter().enumerate() {
+            if let Some(first) = seen.insert(&row.id, i + 1) {
+                return Err(LoaderError::DuplicateId {
+                    id: row.id.clone(),
+                    first,
+                    second: i + 1,
+                });
+            }
+        }
+        self.scopes = scopes;
         let ops = diff(&self.current, &next);
         let next_map: HashMap<String, ResolvedRow> =
             next.iter().cloned().map(|r| (r.id.clone(), r)).collect();
@@ -278,7 +297,9 @@ impl Loader {
                 }
                 Op::Noop(_id) => report.unchanged += 1,
                 Op::Mount(id) => {
-                    let Some(row) = next_map.get(&id) else { continue };
+                    let Some(row) = next_map.get(&id) else {
+                        continue;
+                    };
                     if row.disabled {
                         report.unchanged += 1;
                         continue;
@@ -292,7 +313,9 @@ impl Loader {
                     }
                 }
                 Op::Reconfig(id) => {
-                    let Some(row) = next_map.get(&id) else { continue };
+                    let Some(row) = next_map.get(&id) else {
+                        continue;
+                    };
                     if let Some(handle) = self.mounted.remove(&id) {
                         if let Err(e) = handle.dispose().await {
                             failed_ids.push(id.clone());
@@ -315,6 +338,33 @@ impl Loader {
             }
         }
 
+        // A row can become Failed after its mount (a later dependency may
+        // have activated it). Inspect all handles after the complete pass.
+        for row in &next {
+            let Some(handle) = self.mounted.get(&row.id) else {
+                continue;
+            };
+            use nucleus_core::FiberState;
+            match handle.state() {
+                FiberState::Active => report.active.push(row.id.clone()),
+                FiberState::Pending | FiberState::Loading => report.pending.push(row.id.clone()),
+                state => {
+                    let message = handle
+                        .info()
+                        .and_then(|i| i.error)
+                        .unwrap_or_else(|| state.to_string());
+                    let handle = self.mounted.remove(&row.id).expect("observed handle");
+                    let message = match handle.dispose().await {
+                        Ok(()) => message,
+                        Err(e) => format!("{message}; cleanup: {e}"),
+                    };
+                    report.mounted.retain(|id| id != &row.id);
+                    report.remounted.retain(|id| id != &row.id);
+                    failed_ids.push(row.id.clone());
+                    report.failed.push((row.id.clone(), message));
+                }
+            }
+        }
         // Failed rows stay out of `current`: an identical next pass must
         // re-derive a Mount and retry (e.g. a wasm file that was mid-write
         // during a compile). Without this a transient failure would stick

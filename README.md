@@ -124,12 +124,21 @@ Verified versions: wit-bindgen 0.51 (needs `generate_all` in
 
 Notes: guests are bounded by fuel (default 10M/call, re-armed before each
 guest entry) and a 64 MiB memory cap; events are fanned out into guest
-`stream<event>` subscriptions with drop-on-slow semantics (the host never
-blocks on a slow guest); unmounting runs guest `dispose-effect` callbacks
+`stream<event>` subscriptions. A full queue drops only that event; later
+events can still reach the subscriber. The high-level Rust guest callback and
+waterfall registration APIs return an unsupported error; use the WIT stream
+for events. On the host, unmounting runs guest `dispose-effect` callbacks
 in LIFO order, then drops the Store (cancelling in-flight guest calls) —
 all verified against a real guest by the tests above. Pinned wasmtime
 **47** — WASI 0.3 stable support and the future-drop cancellation fix
 (GHSA-xjhv-v822-pf94, fixed in 42+).
+
+Native `App::shutdown` closes admission and starts one teardown. All waiters
+observe its terminal result, including failures, even if an earlier waiter
+was cancelled. Loader reconciliation distinguishes active, pending and failed
+rows; duplicate IDs are rejected before mounting. HMR reopens one configuration
+file (at most 1 MiB) every 250 ms and compares its contents, including when an
+editor replaces the path by renaming a file.
 
 ## Tests
 

@@ -51,7 +51,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use nucleus::host::host::{call_service, provide_service, register_effect, subscribe};
+use nucleus::host::host::{call_service, provide_service, register_effect};
 
 /// Guest-side implementation of [`Host`]. Every method bridges to the
 /// corresponding WIT host import. Unsupported operations (waterfall, child
@@ -64,7 +64,6 @@ pub struct GuestHost {
     /// Guest-provided `Invokable` services, keyed by name. When the host
     /// calls `handle-service`, we dispatch to the matching service.
     pub services: Mutex<HashMap<String, Arc<dyn Invokable>>>,
-    next_id: Mutex<u64>,
     /// Weak reference to self, so `&self` methods can recover an `Arc<Self>`.
     self_weak: Weak<Self>,
 }
@@ -74,7 +73,6 @@ impl GuestHost {
         Arc::new_cyclic(|weak| Self {
             disposers: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
-            next_id: Mutex::new(0),
             self_weak: weak.clone(),
         })
     }
@@ -91,13 +89,6 @@ impl GuestHost {
             scope: 0,
             activation: 0,
         }
-    }
-
-    fn next_id(&self) -> u64 {
-        let mut id = self.next_id.lock().unwrap();
-        let v = *id;
-        *id += 1;
-        v
     }
 }
 
@@ -163,23 +154,14 @@ impl Host for GuestHost {
         &self,
         _fiber: FiberId,
         _activation: u64,
-        name: &str,
-        handler: PlainBox,
+        _name: &str,
+        _handler: PlainBox,
     ) -> nucleus_core::Result<u64> {
-        let id = self.next_id();
-        let name = name.to_string();
-        let ctx = self.context();
-        // Subscribe to the event stream. In a wasm32 guest we can't spawn
-        // tokio tasks, so we drive the stream synchronously via a polling
-        // loop on the guest's main thread. For simplicity, we store the
-        // handler and let the export_plugin! macro's event loop drive it.
-        //
-        // Note: a full implementation would use a cooperative scheduler.
-        // Here we register the subscription and rely on the host to deliver
-        // events through the stream.
-        let _stream = subscribe(name.clone());
-        let _ = (ctx, handler);
-        Ok(id)
+        Err(Error::ApplyFailed(
+            "guest".into(),
+            "callback listeners are unsupported in Wasm guests; consume the WIT event stream"
+                .into(),
+        ))
     }
 
     fn add_waterfall_listener(
@@ -221,12 +203,12 @@ impl Host for GuestHost {
         &self,
         _fiber: FiberId,
         _activation: u64,
-        handler: TapBox,
+        _handler: TapBox,
     ) -> nucleus_core::Result<u64> {
-        let id = self.next_id();
-        let _stream = subscribe("*".to_string());
-        let _ = handler;
-        Ok(id)
+        Err(Error::ApplyFailed(
+            "guest".into(),
+            "callback taps are unsupported in Wasm guests".into(),
+        ))
     }
 
     fn remove_tap(&self, _id: u64) {}

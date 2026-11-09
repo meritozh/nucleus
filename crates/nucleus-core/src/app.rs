@@ -89,6 +89,7 @@ impl App {
                 parent: None,
                 children: Vec::new(),
                 inject: Vec::new(),
+                bindings: HashMap::new(),
                 scope: GLOBAL,
                 disposers: Vec::new(),
                 provides: Vec::new(),
@@ -98,6 +99,7 @@ impl App {
         state.roots.push(0);
         let inner = Arc::new_cyclic(|weak| AppInner {
             state: Mutex::new(state),
+            shutdown_result: Mutex::new(None),
             runtime,
             waking: AtomicBool::new(false),
             self_weak: weak.clone(),
@@ -259,6 +261,50 @@ impl App {
     /// Unload every root fiber in reverse mount order (including the app
     /// fiber 0), unwinding all effects.
     pub async fn shutdown(&self) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let failures = {
+            use futures::FutureExt;
+            let result = {
+                let mut slot = self
+                    .inner
+                    .shutdown_result
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                slot.get_or_insert_with(|| {
+                    // Close admission before returning the first waiter. A timeout
+                    // drops only its clone; the executor continues owning teardown.
+                    self.inner.lock_state().shut_down = true;
+                    let app = self.clone();
+                    let task = self
+                        .inner
+                        .runtime
+                        .spawn(async move { app.shutdown_roots().await });
+                    async move {
+                        task.await.unwrap_or_else(|e| {
+                            vec![DisposeFailure {
+                                fiber_id: 0,
+                                plugin: "app".into(),
+                                message: e.to_string(),
+                            }]
+                        })
+                    }
+                    .boxed()
+                    .shared()
+                })
+                .clone()
+            };
+            result.await
+        };
+        #[cfg(target_arch = "wasm32")]
+        let failures = self.shutdown_roots().await;
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::DisposeFailures(failures))
+        }
+    }
+
+    async fn shutdown_roots(&self) -> Vec<DisposeFailure> {
         let roots: Vec<FiberId> = {
             let mut st = self.inner.lock_state();
             st.shut_down = true;
@@ -270,11 +316,7 @@ impl App {
                 append_dispose_error(&mut failures, id, "app", error);
             }
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::DisposeFailures(failures))
-        }
+        failures
     }
 }
 

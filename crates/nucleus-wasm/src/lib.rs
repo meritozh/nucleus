@@ -97,7 +97,11 @@ impl SubscriberRegistry {
             if !Self::matches(pattern, name) {
                 return true;
             }
-            tx.try_send(event.clone()).is_ok()
+            // A full queue drops this event; it does not end the stream.
+            !matches!(
+                tx.try_send(event.clone()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            )
         });
     }
 
@@ -541,6 +545,27 @@ mod tests {
         assert_eq!(got.payload, "1");
         let chans = reg.channels.lock().unwrap();
         assert_eq!(chans.len(), 2, "closed channel reaped: {chans:?}");
+    }
+
+    #[test]
+    fn full_guest_queue_can_receive_later_events() {
+        let reg = SubscriberRegistry::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        reg.channels.lock().unwrap().push(("*".into(), tx));
+        let send = |payload: &str| {
+            reg.dispatch(
+                "a",
+                Event {
+                    name: "a".into(),
+                    payload: payload.into(),
+                },
+            )
+        };
+        send("first");
+        send("dropped");
+        assert_eq!(rx.try_recv().unwrap().payload, "first");
+        send("third");
+        assert_eq!(rx.try_recv().unwrap().payload, "third");
     }
 
     #[test]

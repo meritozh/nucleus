@@ -78,6 +78,8 @@ pub(crate) struct FiberData {
     pub parent: Option<FiberId>,
     pub children: Vec<FiberId>,
     pub inject: Vec<String>,
+    /// Provider selected for each declared dependency in this activation.
+    pub(crate) bindings: HashMap<String, FiberId>,
     pub scope: ScopeId,
     /// LIFO disposer stack; registration order, unwound in reverse.
     pub disposers: Vec<Disposer>,
@@ -124,21 +126,14 @@ impl AppState {
         )
         .then_some(entry)
     }
-
-    fn service_provider(&self, scope: ScopeId, name: &str) -> Option<FiberId> {
-        self.services
-            .get(&(scope, name.to_string()))
-            .or_else(|| {
-                (scope != GLOBAL)
-                    .then(|| self.services.get(&(GLOBAL, name.to_string())))
-                    .flatten()
-            })
-            .map(|entry| entry.provider)
-    }
 }
 
 pub(crate) struct AppInner {
     pub state: Mutex<AppState>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub shutdown_result:
+        Mutex<Option<futures::future::Shared<BoxFuture<'static, Vec<DisposeFailure>>>>>,
+
     /// Tokio handle used to spawn `emit` fire-and-forget dispatches and to
     /// arm unload timeouts. Only present on the host (native); Wasm guests
     /// forward async work to the host via WIT imports.
@@ -186,6 +181,19 @@ pub trait Host: Any + Send + Sync {
     /// Look up a service by `(scope, name)` and `type_id`.
     fn get_service(&self, scope: ScopeId, name: &str, type_id: TypeId)
         -> Result<Box<dyn CloneAny>>;
+
+    /// Lookup for a specific activation. Native hosts pin declared dependencies;
+    /// guest hosts may resolve services through their host bridge.
+    fn get_bound_service(
+        &self,
+        _fiber: FiberId,
+        _activation: u64,
+        scope: ScopeId,
+        name: &str,
+        type_id: TypeId,
+    ) -> Result<Box<dyn CloneAny>> {
+        self.get_service(scope, name, type_id)
+    }
 
     /// Whether a service exists at `(scope, name)` (falling back to GLOBAL).
     fn service_exists(&self, scope: ScopeId, name: &str) -> bool;
@@ -309,19 +317,13 @@ impl AppInner {
     }
 
     fn service_dependents_locked(st: &AppState, id: FiberId) -> Vec<FiberId> {
-        let Some(provider) = st.fibers.get(&id) else {
-            return Vec::new();
-        };
         let mut affected = st
             .fibers
             .values()
             .filter(|fiber| {
                 fiber.id != id
                     && matches!(fiber.state, FiberState::Active | FiberState::Loading)
-                    && fiber.inject.iter().any(|name| {
-                        provider.provides.iter().any(|provided| provided == name)
-                            && st.service_provider(fiber.scope, name) == Some(id)
-                    })
+                    && fiber.bindings.values().any(|bound| *bound == id)
             })
             .map(|fiber| fiber.id)
             .collect::<Vec<_>>();
@@ -441,6 +443,7 @@ impl AppInner {
                     parent,
                     children: Vec::new(),
                     inject,
+                    bindings: HashMap::new(),
                     scope,
                     disposers: Vec::new(),
                     provides: Vec::new(),
@@ -484,12 +487,23 @@ impl AppInner {
                 return;
             }
             let scope = f.scope;
-            let unsatisfied = f.inject.iter().any(|n| !st.service_exists(scope, n));
-            if unsatisfied {
-                return; // stay Pending: a provider may mount later
+            let Some(bindings) = f
+                .inject
+                .iter()
+                .map(|name| {
+                    st.service_entry(scope, name)
+                        .map(|entry| (name.clone(), entry.provider))
+                })
+                .collect::<Option<HashMap<_, _>>>()
+            else {
+                return;
+            };
+            if st.shut_down {
+                return;
             }
             let plugin = f.plugin.clone();
             if let Some(f) = st.fibers.get_mut(&id) {
+                f.bindings = bindings;
                 f.activation = f.activation.wrapping_add(1);
                 f.state = FiberState::Loading;
             }
@@ -679,10 +693,11 @@ impl AppInner {
         // satisfiable, run one more round.
         let satisfiable = {
             let st = self.lock_state();
-            st.fibers.values().any(|f| {
-                f.state == FiberState::Pending
-                    && f.inject.iter().all(|n| st.service_exists(f.scope, n))
-            })
+            !st.shut_down
+                && st.fibers.values().any(|f| {
+                    f.state == FiberState::Pending
+                        && f.inject.iter().all(|n| st.service_exists(f.scope, n))
+                })
         };
         if satisfiable {
             Box::pin(self.wake_pending()).await;
@@ -741,12 +756,14 @@ impl AppInner {
         self.remove_fiber_services(id);
         {
             let mut st = self.lock_state();
-            if let Some(p) = parent {
-                if let Some(pf) = st.fibers.get_mut(&p) {
-                    pf.children.retain(|c| *c != id);
+            if !repend {
+                if let Some(p) = parent {
+                    if let Some(pf) = st.fibers.get_mut(&p) {
+                        pf.children.retain(|c| *c != id);
+                    }
                 }
+                st.roots.retain(|r| *r != id);
             }
-            st.roots.retain(|r| *r != id);
             if let Some(f) = st.fibers.get_mut(&id) {
                 f.children.clear();
                 f.provides.clear();
@@ -944,6 +961,44 @@ impl Host for AppInner {
         if entry.type_id != type_id {
             return Err(Error::ServiceTypeMismatch {
                 name: name.to_string(),
+                provided: entry.type_id,
+                requested: type_id,
+            });
+        }
+        Ok(entry.value.clone_box())
+    }
+
+    fn get_bound_service(
+        &self,
+        fiber: FiberId,
+        activation: u64,
+        scope: ScopeId,
+        name: &str,
+        type_id: TypeId,
+    ) -> Result<Box<dyn CloneAny>> {
+        let st = self.lock_state();
+        let f = st
+            .fibers
+            .get(&fiber)
+            .filter(|f| {
+                f.activation == activation
+                    && matches!(f.state, FiberState::Active | FiberState::Loading)
+            })
+            .ok_or(Error::FiberNotLive(fiber))?;
+        let entry = if let Some(provider) = f.bindings.get(name) {
+            let p = st
+                .fibers
+                .get(provider)
+                .filter(|p| matches!(p.state, FiberState::Active | FiberState::Loading));
+            p.and_then(|p| st.services.get(&(p.scope, name.to_owned())))
+                .filter(|e| e.provider == *provider)
+        } else {
+            st.service_entry(scope, name)
+        };
+        let entry = entry.ok_or_else(|| Error::ServiceMissing(name.to_owned()))?;
+        if entry.type_id != type_id {
+            return Err(Error::ServiceTypeMismatch {
+                name: name.to_owned(),
                 provided: entry.type_id,
                 requested: type_id,
             });

@@ -5,78 +5,56 @@
 //! mechanism (same insight as nucleus-plugin-hmr).
 
 use crate::Loader;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::io::AsyncReadExt;
 
-/// Debounce window for coalescing editor save events.
-const DEBOUNCE: Duration = Duration::from_millis(200);
+// Re-open the configured pathname so an editor's atomic rename is observed
+// even on filesystems that coalesce or omit change notifications.
+const CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+async fn read_config(path: &Path) -> crate::Result<String> {
+    let mut content = String::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut content)
+        .await?;
+    if content.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(crate::LoaderError::Watch(
+            "configuration exceeds 1 MiB".into(),
+        ));
+    }
+    Ok(content)
+}
 
-/// Run one reconcile now, then watch `path` until the watcher is dropped
-/// or the task is aborted. Bad reads keep the last good state and log.
+/// Monitor one configuration file. Invalid edits retain the last applied
+/// configuration. A cancelled monitor owns no blocked receiver thread.
 pub async fn run_hmr(app: nucleus_core::App, path: impl Into<PathBuf>) -> crate::Result<()> {
-    let path: PathBuf = path.into();
+    let path = path.into();
     let mut loader = Loader::new(app);
-
-    let report = loader.load_file(&path).await?;
-    tracing::info!(path = %path.display(), report = %report.summary(), "initial load");
-
-    let (tx, rx) = mpsc::channel::<Event>();
-    let rx = Arc::new(Mutex::new(rx));
-    let mut watcher: RecommendedWatcher = Watcher::new(
-        move |res: std::result::Result<Event, notify::Error>| {
-            if let Ok(ev) = res {
-                let _ = tx.send(ev);
-            }
-        },
-        notify::Config::default(),
-    )
-    .map_err(|e| crate::LoaderError::Watch(e.to_string()))?;
-    watcher
-        .watch(path.as_path(), RecursiveMode::NonRecursive)
-        .map_err(|e| crate::LoaderError::Watch(e.to_string()))?;
-    let _watcher = watcher; // kept alive for the loop duration
-
+    let mut previous = read_config(&path).await?;
+    let report = loader.load_str(&previous).await?;
+    tracing::info!(path=%path.display(),report=%report.summary(),"initial load");
     loop {
-        // notify hands us events on a sync channel; bridge without
-        // block_in_place so this works on current-thread runtimes too.
-        let ev = {
-            let rx = rx.clone();
-            tokio::task::spawn_blocking(move || rx.lock().unwrap().recv())
-                .await
-                .map_err(|e| crate::LoaderError::Watch(e.to_string()))?
-        };
-        let ev = match ev {
-            Ok(ev) => ev,
-            Err(_) => return Ok(()), // watcher dropped: stop
-        };
-        if !matches!(
-            ev.kind,
-            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-        ) {
-            continue;
-        }
-        // Give editors that write via rename/replace a moment to settle,
-        // then drain whatever coalesced behind the event we saw (one save
-        // typically emits several events; each must not trigger its own
-        // reconcile).
-        tokio::time::sleep(DEBOUNCE).await;
-        {
-            let rx = rx.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || while rx.lock().unwrap().try_recv().is_ok() {})
-                    .await;
-        }
-        match loader.load_file(&path).await {
-            Ok(report) => {
-                tracing::info!(report = %report.summary(), "reconciled after config change");
-            }
+        tokio::time::sleep(CHECK_INTERVAL).await;
+        let yaml = match read_config(&path).await {
+            Ok(value) if value == previous => continue,
+            Ok(value) => value,
             Err(e) => {
-                tracing::warn!(error = %e, "config reload failed; keeping last good state");
+                tracing::warn!(error=%e,"configuration unavailable");
+                continue;
             }
+        };
+        match loader.load_str(&yaml).await {
+            Ok(report) => {
+                tracing::info!(report=%report.summary(),"reconciled changed configuration")
+            }
+            Err(e) => tracing::warn!(error=%e,"configuration rejected; keeping last good state"),
         }
+        previous = yaml;
     }
 }
 

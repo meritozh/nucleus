@@ -186,7 +186,13 @@ impl Context {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let boxed = self.host.get_service(self.scope, name, TypeId::of::<T>())?;
+        let boxed = self.host.get_bound_service(
+            self.fiber,
+            self.activation,
+            self.scope,
+            name,
+            TypeId::of::<T>(),
+        )?;
         boxed
             .downcast_ref::<Arc<T>>()
             .cloned()
