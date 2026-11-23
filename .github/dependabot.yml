@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # One root entry covers every member of the Cargo workspace.
+  # examples/wasm-guest is a standalone workspace but has no Cargo.lock.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
