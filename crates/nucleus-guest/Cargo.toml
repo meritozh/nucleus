@@ -11,7 +11,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-wit-bindgen = "0.51"
+wit-bindgen = "0.63"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
